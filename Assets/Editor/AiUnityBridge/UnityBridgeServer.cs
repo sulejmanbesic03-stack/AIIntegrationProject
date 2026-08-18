@@ -40,7 +40,7 @@ public static class UnityBridgeServer
 
     private static Thread listenerThread;
 
-    private static bool isRunning;
+    private static volatile bool isRunning;
 
 
     static UnityBridgeServer()
@@ -164,22 +164,17 @@ public static class UnityBridgeServer
                 TcpClient client =
                     listener.AcceptTcpClient();
 
-
-                BridgeRequest request =
-                    ReadRequest(
+                ThreadPool.QueueUserWorkItem(
+                    _ => ReadAndQueueRequest(
                         client
-                    );
-
-
-                pendingRequests.Enqueue(
-                    request
+                    )
                 );
             }
             catch (SocketException)
             {
                 if (isRunning)
                 {
-                    Debug.LogError(
+                    Debug.LogWarning(
                         "AI Unity Bridge listener je neočekivano zaustavljen."
                     );
                 }
@@ -188,11 +183,51 @@ public static class UnityBridgeServer
             {
                 if (isRunning)
                 {
-                    Debug.LogError(
+                    Debug.LogWarning(
                         $"AI Unity Bridge greška: {ex.Message}"
                     );
                 }
             }
+        }
+    }
+
+
+    private static void ReadAndQueueRequest(
+        TcpClient client
+    )
+    {
+        try
+        {
+            BridgeRequest request =
+                ReadRequest(
+                    client
+                );
+
+
+            pendingRequests.Enqueue(
+                request
+            );
+        }
+        catch (IOException)
+        {
+            client.Dispose();
+        }
+        catch (SocketException)
+        {
+            client.Dispose();
+        }
+        catch (ObjectDisposedException)
+        {
+            // Server se gasi ili je klijent zatvorio konekciju.
+        }
+        catch (Exception ex)
+        {
+            client.Dispose();
+
+
+            Debug.LogWarning(
+                $"AI Unity Bridge je odbacio neispravan zahtjev: {ex.Message}"
+            );
         }
     }
 
