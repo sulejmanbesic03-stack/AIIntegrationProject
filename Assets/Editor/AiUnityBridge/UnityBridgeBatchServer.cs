@@ -1,4 +1,6 @@
+﻿using Codice.CM.Common.Replication;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Net;
@@ -9,6 +11,7 @@ using UnityEditor;
 using UnityEditor.SceneManagement;
 
 using UnityEngine;
+using UnityEngine.Rendering;
 
 
 [InitializeOnLoad]
@@ -26,20 +29,50 @@ public static class UnityBridgeBatchServer
 
     private static Thread listenerThread;
 
-    private static bool running;
+    private static volatile bool running;
 
+    private static readonly ConcurrentQueue<PendingBatch>
+        pendingBatches =
+            new ConcurrentQueue<PendingBatch>();
+
+    private static readonly Dictionary<string, Type>
+    componentTypeCache =
+        new Dictionary<string, Type>(
+            StringComparer.OrdinalIgnoreCase
+        );
 
     // ============================================================
     // START
     // ============================================================
-
     static UnityBridgeBatchServer()
     {
+        EditorApplication.update +=
+            ProcessPendingBatches;
+
+        AssemblyReloadEvents.beforeAssemblyReload +=
+            Stop;
+
+        EditorApplication.quitting +=
+            Stop;
+
         EditorApplication.delayCall +=
             Start;
     }
 
+    private static void Stop()
+    {
+        running = false;
 
+        try
+        {
+            listener?.Stop();
+            listener?.Close();
+        }
+        catch
+        {
+            // Unity se gasi ili ponovo učitava assemblyje.
+        }
+    }
     private static void Start()
     {
         if (running)
@@ -272,16 +305,12 @@ public static class UnityBridgeBatchServer
                 return;
             }
 
-
-            // All Unity API calls must happen on main thread.
-            EditorApplication.delayCall +=
-                () =>
-                {
-                    ExecuteBatch(
-                        context,
-                        request
-                    );
-                };
+            pendingBatches.Enqueue(
+                new PendingBatch(
+                    context,
+                    request
+                )
+            );
         }
         catch (Exception ex)
         {
@@ -306,7 +335,20 @@ public static class UnityBridgeBatchServer
     // ============================================================
     // EXECUTE BATCH
     // ============================================================
-
+    private static void ProcessPendingBatches()
+    {
+        while (
+            pendingBatches.TryDequeue(
+                out PendingBatch pending
+            )
+        )
+        {
+            ExecuteBatch(
+                pending.context,
+                pending.request
+            );
+        }
+    }
     private static void ExecuteBatch(
         HttpListenerContext context,
         BatchRequest request
@@ -369,10 +411,44 @@ public static class UnityBridgeBatchServer
 
 
             if (
-                request.saveScene
-            )
+                  request.saveScene
+              )
             {
-                EditorSceneManager.SaveOpenScenes();
+                UnityEngine.SceneManagement.Scene activeScene =
+                    UnityEngine.SceneManagement.SceneManager
+                        .GetActiveScene();
+
+                if (
+                    !activeScene.IsValid()
+                )
+                {
+                    throw new InvalidOperationException(
+                        "Active Unity scene is not valid."
+                    );
+                }
+
+                if (
+                    string.IsNullOrWhiteSpace(
+                        activeScene.path
+                    )
+                )
+                {
+                    throw new InvalidOperationException(
+                        "Active scene has no path. Save it manually once first."
+                    );
+                }
+
+                bool sceneSaved =
+                    EditorSceneManager.SaveScene(
+                        activeScene
+                    );
+
+                if (!sceneSaved)
+                {
+                    throw new InvalidOperationException(
+                        "Unity could not save the active scene."
+                    );
+                }
             }
 
 
@@ -1218,9 +1294,10 @@ public static class UnityBridgeBatchServer
 
 
         SerializedProperty property =
-            serializedObject.FindProperty(
-                operation.propertyName
-            );
+      FindSerializedProperty(
+          serializedObject,
+          operation.propertyName
+      );
 
 
         if (
@@ -1340,7 +1417,111 @@ public static class UnityBridgeBatchServer
     // ============================================================
     // CREATE SCRIPT
     // ============================================================
+    private static SerializedProperty FindSerializedProperty(
+    SerializedObject serializedObject,
+    string requestedName
+)
+    {
+        if (string.IsNullOrWhiteSpace(requestedName))
+        {
+            return null;
+        }
 
+        // Prvo pokušava tačan Unity serialized naziv.
+        SerializedProperty exactProperty =
+            serializedObject.FindProperty(requestedName);
+
+        if (exactProperty != null)
+        {
+            return exactProperty;
+        }
+
+        // Ako agent pošalje mass, pokušava pronaći m_Mass.
+        string normalizedRequestedName =
+            NormalizeSerializedPropertyName(requestedName);
+
+        SerializedProperty iterator =
+            serializedObject.GetIterator();
+
+        bool enterChildren = true;
+
+        while (iterator.NextVisible(enterChildren))
+        {
+            enterChildren = false;
+
+            // Friendly pretragu radimo samo nad glavnim svojstvima
+            // kako ne bismo slučajno pogodili neko duboko nested polje.
+            if (iterator.depth != 0)
+            {
+                continue;
+            }
+
+            string normalizedInternalName =
+                NormalizeSerializedPropertyName(
+                    iterator.name
+                );
+
+            string normalizedDisplayName =
+                NormalizeSerializedPropertyName(
+                    iterator.displayName
+                );
+
+            if (
+                string.Equals(
+                    normalizedRequestedName,
+                    normalizedInternalName,
+                    StringComparison.OrdinalIgnoreCase
+                ) ||
+                string.Equals(
+                    normalizedRequestedName,
+                    normalizedDisplayName,
+                    StringComparison.OrdinalIgnoreCase
+                )
+            )
+            {
+                return iterator.Copy();
+            }
+        }
+
+        return null;
+    }
+
+    private static string NormalizeSerializedPropertyName(
+        string propertyName
+    )
+    {
+        if (string.IsNullOrWhiteSpace(propertyName))
+        {
+            return "";
+        }
+
+        // m_Mass postaje Mass, m_IsKinematic postaje IsKinematic itd.
+        if (
+            propertyName.StartsWith(
+                "m_",
+                StringComparison.OrdinalIgnoreCase
+            )
+        )
+        {
+            propertyName =
+                propertyName.Substring(2);
+        }
+
+        StringBuilder normalizedName =
+            new StringBuilder(propertyName.Length);
+
+        foreach (char character in propertyName)
+        {
+            if (char.IsLetterOrDigit(character))
+            {
+                normalizedName.Append(
+                    char.ToLowerInvariant(character)
+                );
+            }
+        }
+
+        return normalizedName.ToString();
+    }
     private static string CreateScript(
         BatchOperation operation
     )
@@ -1573,81 +1754,81 @@ public static class UnityBridgeBatchServer
     // ============================================================
 
     private static Type FindType(
-        string typeName
-    )
+     string typeName
+ )
     {
+        if (string.IsNullOrWhiteSpace(typeName))
+        {
+            return null;
+        }
+
         if (
-            string.IsNullOrWhiteSpace(
-                typeName
+            componentTypeCache.TryGetValue(
+                typeName,
+                out Type cachedType
             )
         )
         {
-            return
-                null;
+            return cachedType;
         }
 
-
-        Type direct =
-            Type.GetType(
-                typeName
-            );
-
-
-        if (
-            direct != null
-        )
-        {
-            return
-                direct;
-        }
-
-
+        // Prvo pokušaj brzo pronalaženje punog imena
+        // bez assembly.GetTypes() skeniranja.
         foreach (
             System.Reflection.Assembly assembly
             in AppDomain.CurrentDomain.GetAssemblies()
         )
         {
-            Type type =
+            Type exactType =
                 assembly.GetType(
-                    typeName
+                    typeName,
+                    throwOnError: false,
+                    ignoreCase: true
                 );
 
-
             if (
-                type != null
+                exactType != null
+                &&
+                typeof(Component).IsAssignableFrom(
+                    exactType
+                )
             )
             {
-                return
-                    type;
-            }
+                componentTypeCache[typeName] =
+                    exactType;
 
-
-            try
-            {
-                foreach (
-                    Type candidate
-                    in assembly.GetTypes()
-                )
-                {
-                    if (
-                        candidate.Name ==
-                        typeName
-                    )
-                    {
-                        return
-                            candidate;
-                    }
-                }
-            }
-            catch
-            {
-                // Some Unity assemblies cannot enumerate every type.
+                return exactType;
             }
         }
 
+        // Za kratka imena poput Rigidbody koristi
+        // Unityjev već pripremljen i optimizovan TypeCache.
+        foreach (
+            Type candidate
+            in TypeCache.GetTypesDerivedFrom<Component>()
+        )
+        {
+            if (
+                candidate.Name.Equals(
+                    typeName,
+                    StringComparison.OrdinalIgnoreCase
+                )
+                ||
+                string.Equals(
+                    candidate.FullName,
+                    typeName,
+                    StringComparison.OrdinalIgnoreCase
+                )
+            )
+            {
+                componentTypeCache[typeName] =
+                    candidate;
 
-        return
-            null;
+                return candidate;
+            }
+        }
+
+        return null;
     }
 
 
@@ -1847,5 +2028,23 @@ public static class UnityBridgeBatchServer
         public bool success;
 
         public string message;
+    }
+    private sealed class PendingBatch
+    {
+        public HttpListenerContext context;
+
+        public BatchRequest request;
+
+        public PendingBatch(
+            HttpListenerContext context,
+            BatchRequest request
+        )
+        {
+            this.context =
+                context;
+
+            this.request =
+                request;
+        }
     }
 }
