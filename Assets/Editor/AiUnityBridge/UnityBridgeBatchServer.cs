@@ -1,5 +1,4 @@
-﻿using Codice.CM.Common.Replication;
-using System;
+﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
@@ -11,7 +10,6 @@ using UnityEditor;
 using UnityEditor.SceneManagement;
 
 using UnityEngine;
-using UnityEngine.Rendering;
 
 
 [InitializeOnLoad]
@@ -1535,7 +1533,7 @@ public static class UnityBridgeBatchServer
             throw new InvalidOperationException(
                 "assetPath is required."
             );
-           
+
         }
 
 
