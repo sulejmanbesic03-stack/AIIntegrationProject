@@ -1535,6 +1535,7 @@ public static class UnityBridgeBatchServer
             throw new InvalidOperationException(
                 "assetPath is required."
             );
+           
         }
 
 
