@@ -49,6 +49,9 @@ public static class UnityPersistentScriptServer
     private const string JobCompilationScheduledKey =
         "AI.PersistentScript.CompilationScheduled";
 
+    private const string JobCompilationStartedKey =
+        "AI.PersistentScript.CompilationStarted";
+
     private const int MaxCompileStartAttempts =
         2;
 
@@ -57,6 +60,9 @@ public static class UnityPersistentScriptServer
 
     private const double CompileStartTimeoutSeconds =
         12.0;
+
+    private const double ListenerRetryDelaySeconds =
+        1.0;
 
     private static readonly string[] BlockedSourceFragments =
     {
@@ -102,11 +108,13 @@ public static class UnityPersistentScriptServer
     private static HttpListener listener;
     private static Thread listenerThread;
     private static volatile bool running;
+    private static double nextListenerStartTime;
 
 
     static UnityPersistentScriptServer()
     {
         EditorApplication.update += ProcessPendingRequests;
+        EditorApplication.update += EnsureStarted;
         AssemblyReloadEvents.beforeAssemblyReload += Stop;
         EditorApplication.quitting += Stop;
 
@@ -119,8 +127,22 @@ public static class UnityPersistentScriptServer
         CompilationPipeline.compilationFinished +=
             OnCompilationFinished;
 
-        EditorApplication.delayCall += Start;
         EditorApplication.delayCall += RecoverJobAfterReload;
+    }
+
+
+    private static void EnsureStarted()
+    {
+        if (
+            running
+            || EditorApplication.timeSinceStartup <
+                nextListenerStartTime
+        )
+        {
+            return;
+        }
+
+        Start();
     }
 
 
@@ -156,9 +178,25 @@ public static class UnityPersistentScriptServer
         {
             running = false;
 
-            Debug.LogError(
+            try
+            {
+                listener?.Close();
+            }
+            catch
+            {
+            }
+
+            listener = null;
+            listenerThread = null;
+
+            nextListenerStartTime =
+                EditorApplication.timeSinceStartup
+                + ListenerRetryDelaySeconds;
+
+            Debug.LogWarning(
                 "[AI Persistent Script] Start failed: "
                 + ex.Message
+                + " Retrying automatically."
             );
         }
     }
@@ -168,15 +206,22 @@ public static class UnityPersistentScriptServer
     {
         running = false;
 
+        HttpListener listenerToClose =
+            listener;
+
+        listener = null;
+
         try
         {
-            listener?.Stop();
-            listener?.Close();
+            listenerToClose?.Stop();
+            listenerToClose?.Close();
         }
         catch
         {
             // Unity is closing or reloading editor assemblies.
         }
+
+        listenerThread = null;
     }
 
 
@@ -505,20 +550,6 @@ public static class UnityPersistentScriptServer
 
         if (
             state == "pending"
-            && EditorApplication.isCompiling
-        )
-        {
-            SessionState.SetString(
-                JobStateKey,
-                "compiling"
-            );
-
-            state = "compiling";
-        }
-
-        if (
-            state == "pending"
-            && !EditorApplication.isCompiling
         )
         {
             int attempts =
@@ -640,20 +671,23 @@ public static class UnityPersistentScriptServer
                 ""
             );
 
-            AssetDatabase.ImportAsset(
-                assetPath,
-                ImportAssetOptions.ForceUpdate
-                | ImportAssetOptions.ForceSynchronousImport
-            );
-
-            CompilationPipeline.RequestScriptCompilation();
-
-            if (EditorApplication.isCompiling)
+            if (attempts == 0)
             {
-                SessionState.SetString(
-                    JobStateKey,
-                    "compiling"
+                // Importing the new .cs asset normally schedules
+                // compilation by itself. Avoid a synchronous import
+                // followed by EditorApplication.isCompiling: Unity 6
+                // may still be mutating its assembly-builder list.
+                AssetDatabase.ImportAsset(
+                    assetPath,
+                    ImportAssetOptions.ForceUpdate
                 );
+            }
+            else
+            {
+                // Fallback only when no compilationStarted event
+                // arrived after the import. This runs from a later
+                // Editor delayCall on Unity's main thread.
+                CompilationPipeline.RequestScriptCompilation();
             }
         }
         catch (Exception ex)
@@ -730,6 +764,11 @@ public static class UnityPersistentScriptServer
         }
 
         currentCompilerErrors.Clear();
+
+        SessionState.SetBool(
+            JobCompilationStartedKey,
+            true
+        );
 
         SessionState.SetString(
             JobStateKey,
@@ -841,6 +880,35 @@ public static class UnityPersistentScriptServer
             return;
         }
 
+        bool compilationStarted =
+            SessionState.GetBool(
+                JobCompilationStartedKey,
+                false
+            );
+
+        string className =
+            SessionState.GetString(JobClassNameKey, "");
+
+        if (
+            compilationStarted
+            && IsCompiledMonoBehaviourLoaded(
+                className
+            )
+        )
+        {
+            SessionState.SetString(
+                JobStateKey,
+                "compiled"
+            );
+
+            SessionState.SetString(
+                JobDiagnosticsKey,
+                ""
+            );
+
+            return;
+        }
+
         if (state == "pending")
         {
             string jobId =
@@ -859,6 +927,33 @@ public static class UnityPersistentScriptServer
                 assetPath
             );
         }
+    }
+
+
+    private static bool IsCompiledMonoBehaviourLoaded(
+        string className
+    )
+    {
+        if (string.IsNullOrWhiteSpace(className))
+        {
+            return false;
+        }
+
+        return
+            TypeCache
+                .GetTypesDerivedFrom<MonoBehaviour>()
+                .Any(type =>
+                    string.Equals(
+                        type.Name,
+                        className,
+                        StringComparison.Ordinal
+                    )
+                    || string.Equals(
+                        type.FullName,
+                        className,
+                        StringComparison.Ordinal
+                    )
+                );
     }
 
 
@@ -1063,6 +1158,7 @@ public static class UnityPersistentScriptServer
         SessionState.SetInt(JobCompileAttemptsKey, 0);
         SessionState.SetString(JobLastCompileRequestTicksKey, "");
         SessionState.SetBool(JobCompilationScheduledKey, false);
+        SessionState.SetBool(JobCompilationStartedKey, false);
     }
 
 
