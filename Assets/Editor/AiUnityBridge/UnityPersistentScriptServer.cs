@@ -40,6 +40,24 @@ public static class UnityPersistentScriptServer
     private const string JobDiagnosticsKey =
         "AI.PersistentScript.Diagnostics";
 
+    private const string JobCompileAttemptsKey =
+        "AI.PersistentScript.CompileAttempts";
+
+    private const string JobLastCompileRequestTicksKey =
+        "AI.PersistentScript.LastCompileRequestTicks";
+
+    private const string JobCompilationScheduledKey =
+        "AI.PersistentScript.CompilationScheduled";
+
+    private const int MaxCompileStartAttempts =
+        2;
+
+    private const double CompileRetryDelaySeconds =
+        4.0;
+
+    private const double CompileStartTimeoutSeconds =
+        12.0;
+
     private static readonly string[] BlockedSourceFragments =
     {
         "UnityEditor",
@@ -435,14 +453,10 @@ public static class UnityPersistentScriptServer
                 }
             );
 
-            EditorApplication.delayCall +=
-                () =>
-                {
-                    AssetDatabase.ImportAsset(
-                        normalizedAssetPath,
-                        ImportAssetOptions.ForceUpdate
-                    );
-                };
+            ScheduleCompilation(
+                jobId,
+                normalizedAssetPath
+            );
         }
         catch (Exception ex)
         {
@@ -483,6 +497,71 @@ public static class UnityPersistentScriptServer
         string state =
             SessionState.GetString(JobStateKey, "pending");
 
+        string assetPath =
+            SessionState.GetString(JobAssetPathKey, "");
+
+        string className =
+            SessionState.GetString(JobClassNameKey, "");
+
+        if (
+            state == "pending"
+            && EditorApplication.isCompiling
+        )
+        {
+            SessionState.SetString(
+                JobStateKey,
+                "compiling"
+            );
+
+            state = "compiling";
+        }
+
+        if (
+            state == "pending"
+            && !EditorApplication.isCompiling
+        )
+        {
+            int attempts =
+                SessionState.GetInt(
+                    JobCompileAttemptsKey,
+                    0
+                );
+
+            double secondsSinceRequest =
+                GetSecondsSinceLastCompileRequest();
+
+            if (
+                attempts < MaxCompileStartAttempts
+                && (
+                    attempts == 0
+                    || secondsSinceRequest >= CompileRetryDelaySeconds
+                )
+            )
+            {
+                ScheduleCompilation(
+                    storedJobId,
+                    assetPath
+                );
+            }
+            else if (
+                attempts >= MaxCompileStartAttempts
+                && secondsSinceRequest >= CompileStartTimeoutSeconds
+            )
+            {
+                SessionState.SetString(
+                    JobStateKey,
+                    "failed"
+                );
+
+                SessionState.SetString(
+                    JobDiagnosticsKey,
+                    "Unity did not start script compilation after two explicit requests. Check whether the Editor is busy, paused or importing packages."
+                );
+
+                state = "failed";
+            }
+        }
+
         string diagnostics =
             SessionState.GetString(JobDiagnosticsKey, "");
 
@@ -495,10 +574,8 @@ public static class UnityPersistentScriptServer
                 phase = "compile",
                 state = state,
                 jobId = storedJobId,
-                assetPath =
-                    SessionState.GetString(JobAssetPathKey, ""),
-                className =
-                    SessionState.GetString(JobClassNameKey, ""),
+                assetPath = assetPath,
+                className = className,
                 message = state switch
                 {
                     "pending" => "Waiting for Unity compilation to start.",
@@ -513,12 +590,141 @@ public static class UnityPersistentScriptServer
     }
 
 
+    private static void BeginCompilation(
+        string jobId,
+        string assetPath
+    )
+    {
+        if (
+            string.IsNullOrWhiteSpace(jobId)
+            || !string.Equals(
+                jobId,
+                SessionState.GetString(JobIdKey, ""),
+                StringComparison.Ordinal
+            )
+        )
+        {
+            return;
+        }
+
+        try
+        {
+            int attempts =
+                SessionState.GetInt(
+                    JobCompileAttemptsKey,
+                    0
+                );
+
+            if (attempts >= MaxCompileStartAttempts)
+            {
+                return;
+            }
+
+            SessionState.SetInt(
+                JobCompileAttemptsKey,
+                attempts + 1
+            );
+
+            SessionState.SetString(
+                JobLastCompileRequestTicksKey,
+                DateTime.UtcNow.Ticks.ToString()
+            );
+
+            SessionState.SetString(
+                JobStateKey,
+                "pending"
+            );
+
+            SessionState.SetString(
+                JobDiagnosticsKey,
+                ""
+            );
+
+            AssetDatabase.ImportAsset(
+                assetPath,
+                ImportAssetOptions.ForceUpdate
+                | ImportAssetOptions.ForceSynchronousImport
+            );
+
+            CompilationPipeline.RequestScriptCompilation();
+
+            if (EditorApplication.isCompiling)
+            {
+                SessionState.SetString(
+                    JobStateKey,
+                    "compiling"
+                );
+            }
+        }
+        catch (Exception ex)
+        {
+            SessionState.SetString(
+                JobStateKey,
+                "failed"
+            );
+
+            SessionState.SetString(
+                JobDiagnosticsKey,
+                ex.GetType().Name + ": " + ex.Message
+            );
+        }
+    }
+
+
+    private static void ScheduleCompilation(
+        string jobId,
+        string assetPath
+    )
+    {
+        if (
+            string.IsNullOrWhiteSpace(jobId)
+            || SessionState.GetBool(
+                JobCompilationScheduledKey,
+                false
+            )
+        )
+        {
+            return;
+        }
+
+        SessionState.SetBool(
+            JobCompilationScheduledKey,
+            true
+        );
+
+        EditorApplication.delayCall +=
+            () =>
+            {
+                SessionState.SetBool(
+                    JobCompilationScheduledKey,
+                    false
+                );
+
+                BeginCompilation(
+                    jobId,
+                    assetPath
+                );
+            };
+    }
+
+
     private static void OnCompilationStarted(object context)
     {
         string jobId =
             SessionState.GetString(JobIdKey, "");
 
         if (string.IsNullOrWhiteSpace(jobId))
+        {
+            return;
+        }
+
+        string state =
+            SessionState.GetString(JobStateKey, "");
+
+        if (
+            state != "pending"
+            && state != "compiling"
+        )
         {
             return;
         }
@@ -551,6 +757,17 @@ public static class UnityPersistentScriptServer
             return;
         }
 
+        string state =
+            SessionState.GetString(JobStateKey, "");
+
+        if (
+            state != "pending"
+            && state != "compiling"
+        )
+        {
+            return;
+        }
+
         foreach (
             CompilerMessage message
             in compilerMessages ?? Array.Empty<CompilerMessage>()
@@ -574,6 +791,17 @@ public static class UnityPersistentScriptServer
             SessionState.GetString(JobIdKey, "");
 
         if (string.IsNullOrWhiteSpace(jobId))
+        {
+            return;
+        }
+
+        string state =
+            SessionState.GetString(JobStateKey, "");
+
+        if (
+            state != "pending"
+            && state != "compiling"
+        )
         {
             return;
         }
@@ -613,36 +841,60 @@ public static class UnityPersistentScriptServer
             return;
         }
 
-        string className =
-            SessionState.GetString(JobClassNameKey, "");
-
-        if (string.IsNullOrWhiteSpace(className))
+        if (state == "pending")
         {
-            return;
+            string jobId =
+                SessionState.GetString(JobIdKey, "");
+
+            string assetPath =
+                SessionState.GetString(JobAssetPathKey, "");
+
+            SessionState.SetBool(
+                JobCompilationScheduledKey,
+                false
+            );
+
+            ScheduleCompilation(
+                jobId,
+                assetPath
+            );
+        }
+    }
+
+
+    private static double GetSecondsSinceLastCompileRequest()
+    {
+        string ticksText =
+            SessionState.GetString(
+                JobLastCompileRequestTicksKey,
+                ""
+            );
+
+        if (
+            !long.TryParse(
+                ticksText,
+                out long ticks
+            )
+            || ticks <= 0
+        )
+        {
+            return double.MaxValue;
         }
 
-        bool typeLoaded =
-            TypeCache
-                .GetTypesDerivedFrom<MonoBehaviour>()
-                .Any(type =>
-                    string.Equals(
-                        type.Name,
-                        className,
-                        StringComparison.Ordinal
-                    )
-                    || string.Equals(
-                        type.FullName,
-                        className,
-                        StringComparison.Ordinal
-                    )
-                );
-
-        if (typeLoaded)
+        try
         {
-            SessionState.SetString(
-                JobStateKey,
-                "compiled"
-            );
+            return
+                Math.Max(
+                    0.0,
+                    (DateTime.UtcNow - new DateTime(
+                        ticks,
+                        DateTimeKind.Utc
+                    )).TotalSeconds
+                );
+        }
+        catch
+        {
+            return double.MaxValue;
         }
     }
 
@@ -808,6 +1060,9 @@ public static class UnityPersistentScriptServer
         SessionState.SetString(JobAssetPathKey, assetPath);
         SessionState.SetString(JobClassNameKey, className);
         SessionState.SetString(JobDiagnosticsKey, diagnostics);
+        SessionState.SetInt(JobCompileAttemptsKey, 0);
+        SessionState.SetString(JobLastCompileRequestTicksKey, "");
+        SessionState.SetBool(JobCompilationScheduledKey, false);
     }
 
 

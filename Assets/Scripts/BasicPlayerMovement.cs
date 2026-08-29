@@ -1,90 +1,122 @@
 using UnityEngine;
 
 [RequireComponent(typeof(Rigidbody))]
-[RequireComponent(typeof(Collider))]
+[RequireComponent(typeof(CapsuleCollider))]
 public class BasicPlayerMovement : MonoBehaviour
 {
-    public float moveSpeed = 5f;
-    public float lookSensitivity = 2f;
-    public float jumpForce = 5f;
-    public float groundCheckDistance = 0.1f;
-    public LayerMask groundMask = default;
+    [Header("Movement Settings")]
+    [SerializeField] private float moveSpeed = 6f;
+    [SerializeField] private float jumpForce = 5f;
+
+    [Header("Look Settings")]
+    [SerializeField] private float mouseSensitivity = 2f;
+    [SerializeField] private Transform cameraTransform;
+
+    [Header("Ground Check Settings")]
+    [SerializeField] private float groundCheckDistance = 0.2f;
+    [SerializeField] private LayerMask groundMask = ~0;
 
     private Rigidbody rb;
-    private Collider col;
-    private Transform cameraTransform;
-    private float pitch = 0f;
+    private CapsuleCollider capsuleCollider;
 
-    // Cached input values
+    private float pitch = 0f;
     private float cachedHorizontal;
     private float cachedVertical;
     private float cachedMouseX;
     private float cachedMouseY;
-    private bool cachedJumpPressed;
+    private bool jumpRequested;
+    private bool isGrounded;
 
-    void Awake()
+    public bool IsGrounded => isGrounded;
+
+    private void Awake()
     {
         rb = GetComponent<Rigidbody>();
-        col = GetComponent<Collider>();
-        // Ensure we can rotate around Y via physics
-        rb.constraints = RigidbodyConstraints.FreezeRotationX | RigidbodyConstraints.FreezeRotationZ;
+        capsuleCollider = GetComponent<CapsuleCollider>();
 
-        var head = transform.Find("Head");
-        if (head != null)
-        {
-            var cam = head.GetComponentInChildren<Camera>(true);
-            if (cam != null) cameraTransform = cam.transform;
-        }
+        // Lock and hide cursor for FPS camera look
         Cursor.lockState = CursorLockMode.Locked;
         Cursor.visible = false;
-        if (groundMask == 0)
+
+        // Find camera reference if not assigned
+        if (cameraTransform == null)
         {
-            groundMask = LayerMask.GetMask("Default");
+            Camera cam = GetComponentInChildren<Camera>();
+            if (cam != null)
+            {
+                cameraTransform = cam.transform;
+            }
+            else if (Camera.main != null)
+            {
+                cameraTransform = Camera.main.transform;
+            }
         }
+
+        // Configure Rigidbody parameters
+        rb.constraints = RigidbodyConstraints.FreezeRotationX | RigidbodyConstraints.FreezeRotationZ;
+        rb.interpolation = RigidbodyInterpolation.Interpolate;
+        rb.collisionDetectionMode = CollisionDetectionMode.Continuous;
     }
 
-    void Update()
+    private void Update()
     {
-        // Read raw input each frame
-        cachedMouseX = Input.GetAxis("Mouse X") * lookSensitivity;
-        cachedMouseY = Input.GetAxis("Mouse Y") * lookSensitivity;
+        // Read input in Update
         cachedHorizontal = Input.GetAxisRaw("Horizontal");
         cachedVertical = Input.GetAxisRaw("Vertical");
-        cachedJumpPressed = Input.GetButtonDown("Jump");
 
-        // Apply mouse look (rotation) via Rigidbody.MoveRotation later
+        cachedMouseX = Input.GetAxis("Mouse X") * mouseSensitivity;
+        cachedMouseY = Input.GetAxis("Mouse Y") * mouseSensitivity;
+
+        if (Input.GetButtonDown("Jump"))
+        {
+            jumpRequested = true;
+        }
+
+        // Vertical pitch on camera
         pitch -= cachedMouseY;
         pitch = Mathf.Clamp(pitch, -85f, 85f);
         if (cameraTransform != null)
         {
-            cameraTransform.localEulerAngles = new Vector3(pitch, 0f, 0f);
+            cameraTransform.localRotation = Quaternion.Euler(pitch, 0f, 0f);
         }
     }
 
-    void FixedUpdate()
+    private void FixedUpdate()
     {
-        // Apply rotation to the Rigidbody
-        Quaternion targetRotation = Quaternion.Euler(0f, transform.eulerAngles.y + cachedMouseX, 0f);
-        rb.MoveRotation(targetRotation);
+        CheckGroundStatus();
 
-        // Movement
-        Vector3 move = (transform.right * cachedHorizontal + transform.forward * cachedVertical).normalized * moveSpeed;
-        Vector3 velocity = new Vector3(move.x, rb.linearVelocity.y, move.z);
-        rb.linearVelocity = velocity;
+        // Horizontal yaw on body via Rigidbody physics
+        Quaternion yawRotation = Quaternion.Euler(0f, cachedMouseX, 0f);
+        rb.MoveRotation(rb.rotation * yawRotation);
 
-        // Jump
-        if (cachedJumpPressed && IsGrounded())
+        // Movement velocity calculation
+        Vector3 inputDir = (transform.right * cachedHorizontal + transform.forward * cachedVertical).normalized;
+        Vector3 targetVelocity = inputDir * moveSpeed;
+
+        Vector3 velocity = rb.linearVelocity;
+        velocity.x = targetVelocity.x;
+        velocity.z = targetVelocity.z;
+
+        if (jumpRequested)
         {
-            rb.AddForce(Vector3.up * jumpForce, ForceMode.VelocityChange);
+            jumpRequested = false;
+            if (isGrounded)
+            {
+                velocity.y = jumpForce;
+            }
         }
+
+        rb.linearVelocity = velocity;
     }
 
-    bool IsGrounded()
+    private void CheckGroundStatus()
     {
-        // Raycast from slightly above the bottom of the collider
-        float rayStartOffset = 0.05f;
-        float rayLength = (col.bounds.extents.y - rayStartOffset) + groundCheckDistance;
-        Vector3 origin = transform.position + Vector3.up * rayStartOffset;
-        return Physics.Raycast(origin, Vector3.down, rayLength, groundMask);
+        if (capsuleCollider == null) return;
+
+        float checkRadius = capsuleCollider.radius * 0.9f;
+        Vector3 origin = transform.position + capsuleCollider.center;
+        float rayDistance = (capsuleCollider.height * 0.5f - capsuleCollider.radius) + groundCheckDistance + 0.05f;
+
+        isGrounded = Physics.SphereCast(origin, checkRadius, Vector3.down, out _, rayDistance, groundMask, QueryTriggerInteraction.Ignore);
     }
 }
