@@ -216,13 +216,13 @@ public static class UnityBridgeBatchServer
             }
             else
             {
-                Undo.CollapseUndoOperations(undoGroup);
-                transactionClosed = true;
-
                 if (request.saveScene)
                 {
                     SaveActiveScene();
                 }
+
+                Undo.CollapseUndoOperations(undoGroup);
+                transactionClosed = true;
             }
 
             WriteResponse(
