@@ -1,60 +1,69 @@
-﻿using System;
+using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Text;
 using System.Threading;
 
 using UnityEditor;
 using UnityEditor.SceneManagement;
-
 using UnityEngine;
-
+using UnityEngine.SceneManagement;
 
 [InitializeOnLoad]
 public static class UnityBridgeBatchServer
 {
-    private const string Prefix =
-        "http://127.0.0.1:47824/";
+    private const string Prefix = "http://127.0.0.1:47824/";
+    private const string RequiredHeader = "AI-Assistant-Local";
 
+    private static readonly ConcurrentQueue<PendingBatch> pendingBatches =
+        new ConcurrentQueue<PendingBatch>();
 
-    private const string RequiredHeader =
-        "AI-Assistant-Local";
-
+    private static readonly Dictionary<string, Type> componentTypeCache =
+        new Dictionary<string, Type>(StringComparer.OrdinalIgnoreCase);
 
     private static HttpListener listener;
-
     private static Thread listenerThread;
-
     private static volatile bool running;
 
-    private static readonly ConcurrentQueue<PendingBatch>
-        pendingBatches =
-            new ConcurrentQueue<PendingBatch>();
-
-    private static readonly Dictionary<string, Type>
-    componentTypeCache =
-        new Dictionary<string, Type>(
-            StringComparer.OrdinalIgnoreCase
-        );
-
-    // ============================================================
-    // START
-    // ============================================================
     static UnityBridgeBatchServer()
     {
-        EditorApplication.update +=
-            ProcessPendingBatches;
+        EditorApplication.update += ProcessPendingBatches;
+        AssemblyReloadEvents.beforeAssemblyReload += Stop;
+        EditorApplication.quitting += Stop;
+        EditorApplication.delayCall += Start;
+    }
 
-        AssemblyReloadEvents.beforeAssemblyReload +=
-            Stop;
+    private static void Start()
+    {
+        if (running)
+        {
+            return;
+        }
 
-        EditorApplication.quitting +=
-            Stop;
+        try
+        {
+            listener = new HttpListener();
+            listener.Prefixes.Add(Prefix);
+            listener.Start();
 
-        EditorApplication.delayCall +=
-            Start;
+            running = true;
+            listenerThread = new Thread(ListenLoop)
+            {
+                IsBackground = true,
+                Name = "AI Assistant Unity Batch Bridge"
+            };
+            listenerThread.Start();
+
+            Debug.Log("[AI Batch Bridge] Listening on 127.0.0.1:47824 (transactional)");
+        }
+        catch (Exception ex)
+        {
+            running = false;
+            Debug.LogError("[AI Batch Bridge] Start failed: " + ex.Message);
+        }
     }
 
     private static void Stop()
@@ -68,66 +77,8 @@ public static class UnityBridgeBatchServer
         }
         catch
         {
-            // Unity se gasi ili ponovo učitava assemblyje.
         }
     }
-    private static void Start()
-    {
-        if (running)
-        {
-            return;
-        }
-
-
-        try
-        {
-            listener =
-                new HttpListener();
-
-
-            listener.Prefixes.Add(
-                Prefix
-            );
-
-
-            listener.Start();
-
-
-            running =
-                true;
-
-
-            listenerThread =
-                new Thread(
-                    ListenLoop
-                );
-
-
-            listenerThread.IsBackground =
-                true;
-
-
-            listenerThread.Start();
-
-
-            Debug.Log(
-                "[AI Batch Bridge] Listening on 127.0.0.1:47824"
-            );
-        }
-        catch (Exception ex)
-        {
-            Debug.LogError(
-                "[AI Batch Bridge] Start failed: "
-                +
-                ex.Message
-            );
-        }
-    }
-
-
-    // ============================================================
-    // LISTENER
-    // ============================================================
 
     private static void ListenLoop()
     {
@@ -135,1344 +86,615 @@ public static class UnityBridgeBatchServer
         {
             try
             {
-                HttpListenerContext context =
-                    listener.GetContext();
-
-
-                HandleRequest(
-                    context
-                );
+                HttpListenerContext context = listener.GetContext();
+                HandleRequest(context);
             }
             catch (Exception ex)
             {
                 if (running)
                 {
-                    Debug.LogError(
-                        "[AI Batch Bridge] Listener error: "
-                        +
-                        ex.Message
-                    );
+                    Debug.LogError("[AI Batch Bridge] Listener error: " + ex.Message);
                 }
             }
         }
     }
 
-
-    // ============================================================
-    // REQUEST
-    // ============================================================
-
-    private static void HandleRequest(
-        HttpListenerContext context
-    )
+    private static void HandleRequest(HttpListenerContext context)
     {
         try
         {
-            string bridgeHeader =
-                context.Request.Headers[
-                    "X-AI-Bridge"
-                ];
-
-
-            if (
-                bridgeHeader !=
-                RequiredHeader
-            )
+            if (context.Request.Headers["X-AI-Bridge"] != RequiredHeader)
             {
-                WriteResponse(
-                    context,
-                    403,
-                    JsonUtility.ToJson(
-                        new BasicResponse
-                        {
-                            success =
-                                false,
-
-                            message =
-                                "Unauthorized bridge request."
-                        }
-                    )
-                );
-
-
+                WriteResponse(context, 403, JsonUtility.ToJson(new BasicResponse
+                {
+                    success = false,
+                    message = "Unauthorized bridge request."
+                }));
                 return;
             }
 
-
-            if (
-                context.Request.HttpMethod !=
-                "POST"
-            )
+            if (context.Request.HttpMethod != "POST")
             {
-                WriteResponse(
-                    context,
-                    405,
-                    JsonUtility.ToJson(
-                        new BasicResponse
-                        {
-                            success =
-                                false,
-
-                            message =
-                                "POST required."
-                        }
-                    )
-                );
-
-
+                WriteResponse(context, 405, JsonUtility.ToJson(new BasicResponse
+                {
+                    success = false,
+                    message = "POST required."
+                }));
                 return;
             }
 
-
-            string path =
-                context.Request.Url
-                    .AbsolutePath
-                    .TrimEnd('/')
-                    .ToLowerInvariant();
-
-
-            if (
-                path !=
-                "/execute-batch"
-            )
+            string path = context.Request.Url.AbsolutePath.TrimEnd('/').ToLowerInvariant();
+            if (path != "/execute-batch")
             {
-                WriteResponse(
-                    context,
-                    404,
-                    JsonUtility.ToJson(
-                        new BasicResponse
-                        {
-                            success =
-                                false,
-
-                            message =
-                                "Unknown batch endpoint."
-                        }
-                    )
-                );
-
-
+                WriteResponse(context, 404, JsonUtility.ToJson(new BasicResponse
+                {
+                    success = false,
+                    message = "Unknown batch endpoint."
+                }));
                 return;
             }
-
 
             string body;
-
-
-            using (
-                StreamReader reader =
-                    new StreamReader(
-                        context.Request.InputStream,
-                        context.Request.ContentEncoding
-                    )
-            )
+            using (StreamReader reader = new StreamReader(
+                context.Request.InputStream,
+                context.Request.ContentEncoding))
             {
-                body =
-                    reader.ReadToEnd();
+                body = reader.ReadToEnd();
             }
 
-
-            BatchRequest request =
-                JsonUtility.FromJson<BatchRequest>(
-                    body
-                );
-
-
-            if (
-                request == null
-                ||
-                request.operations == null
-            )
+            BatchRequest request = JsonUtility.FromJson<BatchRequest>(body);
+            if (request == null || request.operations == null)
             {
-                WriteResponse(
-                    context,
-                    400,
-                    JsonUtility.ToJson(
-                        new BasicResponse
-                        {
-                            success =
-                                false,
-
-                            message =
-                                "Invalid batch request."
-                        }
-                    )
-                );
-
-
+                WriteResponse(context, 400, JsonUtility.ToJson(new BasicResponse
+                {
+                    success = false,
+                    message = "Invalid batch request."
+                }));
                 return;
             }
 
-            pendingBatches.Enqueue(
-                new PendingBatch(
-                    context,
-                    request
-                )
-            );
+            pendingBatches.Enqueue(new PendingBatch(context, request));
         }
         catch (Exception ex)
         {
-            WriteResponse(
-                context,
-                500,
-                JsonUtility.ToJson(
-                    new BasicResponse
-                    {
-                        success =
-                            false,
-
-                        message =
-                            ex.Message
-                    }
-                )
-            );
+            WriteResponse(context, 500, JsonUtility.ToJson(new BasicResponse
+            {
+                success = false,
+                message = ex.GetType().Name + ": " + ex.Message
+            }));
         }
     }
 
-
-    // ============================================================
-    // EXECUTE BATCH
-    // ============================================================
     private static void ProcessPendingBatches()
     {
-        while (
-            pendingBatches.TryDequeue(
-                out PendingBatch pending
-            )
-        )
+        while (pendingBatches.TryDequeue(out PendingBatch pending))
         {
-            ExecuteBatch(
-                pending.context,
-                pending.request
-            );
+            ExecuteBatch(pending.context, pending.request);
         }
     }
+
     private static void ExecuteBatch(
         HttpListenerContext context,
-        BatchRequest request
-    )
+        BatchRequest request)
     {
-        BatchResponse response =
-            new BatchResponse();
+        BatchResponse response = new BatchResponse
+        {
+            success = true,
+            rolledBack = false,
+            results = new List<OperationResult>()
+        };
 
+        Undo.IncrementCurrentGroup();
+        int undoGroup = Undo.GetCurrentGroup();
+        Undo.SetCurrentGroupName("AI Assistant transactional batch");
 
-        response.success =
-            true;
-
-
-        response.results =
-            new List<OperationResult>();
-
+        bool transactionClosed = false;
 
         try
         {
-            for (
-                int i = 0;
-                i < request.operations.Length;
-                i++
-            )
+            for (int i = 0; i < request.operations.Length; i++)
             {
-                BatchOperation operation =
-                    request.operations[i];
+                OperationResult result = ExecuteOperation(i, request.operations[i]);
+                response.results.Add(result);
 
-
-                OperationResult result =
-                    ExecuteOperation(
-                        i,
-                        operation
-                    );
-
-
-                response.results.Add(
-                    result
-                );
-
-
-                if (
-                    !result.success
-                )
+                if (!result.success)
                 {
-                    response.success =
-                        false;
+                    response.success = false;
 
-
-                    // Default behavior:
-                    // stop dependent work after first failure.
-                    if (
-                        request.stopOnFailure
-                    )
+                    if (request.stopOnFailure)
                     {
                         break;
                     }
                 }
             }
 
-
-            if (
-                  request.saveScene
-              )
+            if (!response.success)
             {
-                UnityEngine.SceneManagement.Scene activeScene =
-                    UnityEngine.SceneManagement.SceneManager
-                        .GetActiveScene();
+                RollbackBatch(undoGroup);
+                transactionClosed = true;
+                response.rolledBack = true;
+            }
+            else
+            {
+                Undo.CollapseUndoOperations(undoGroup);
+                transactionClosed = true;
 
-                if (
-                    !activeScene.IsValid()
-                )
+                if (request.saveScene)
                 {
-                    throw new InvalidOperationException(
-                        "Active Unity scene is not valid."
-                    );
-                }
-
-                if (
-                    string.IsNullOrWhiteSpace(
-                        activeScene.path
-                    )
-                )
-                {
-                    throw new InvalidOperationException(
-                        "Active scene has no path. Save it manually once first."
-                    );
-                }
-
-                bool sceneSaved =
-                    EditorSceneManager.SaveScene(
-                        activeScene
-                    );
-
-                if (!sceneSaved)
-                {
-                    throw new InvalidOperationException(
-                        "Unity could not save the active scene."
-                    );
+                    SaveActiveScene();
                 }
             }
 
-
             WriteResponse(
                 context,
-                response.success
-                    ?
-                    200
-                    :
-                    400,
-
-                JsonUtility.ToJson(
-                    response
-                )
+                response.success ? 200 : 400,
+                JsonUtility.ToJson(response)
             );
         }
         catch (Exception ex)
         {
-            WriteResponse(
-                context,
-                500,
-                JsonUtility.ToJson(
-                    new BasicResponse
-                    {
-                        success =
-                            false,
+            if (!transactionClosed)
+            {
+                try
+                {
+                    RollbackBatch(undoGroup);
+                }
+                catch
+                {
+                }
+            }
 
-                        message =
-                            ex.Message
-                    }
-                )
-            );
+            WriteResponse(context, 500, JsonUtility.ToJson(new BasicResponse
+            {
+                success = false,
+                message = ex.GetType().Name + ": " + ex.Message
+            }));
         }
     }
 
+    private static void RollbackBatch(int undoGroup)
+    {
+        Undo.RevertAllDownToGroup(undoGroup);
+        SceneView.RepaintAll();
+    }
 
-    // ============================================================
-    // EXECUTE ONE OPERATION
-    // ============================================================
+    private static void SaveActiveScene()
+    {
+        Scene scene = SceneManager.GetActiveScene();
+
+        if (!scene.IsValid())
+        {
+            throw new InvalidOperationException("Active Unity scene is not valid.");
+        }
+
+        if (string.IsNullOrWhiteSpace(scene.path))
+        {
+            throw new InvalidOperationException(
+                "Active scene has no path. Save it manually once first."
+            );
+        }
+
+        if (!EditorSceneManager.SaveScene(scene))
+        {
+            throw new InvalidOperationException("Unity could not save the active scene.");
+        }
+    }
 
     private static OperationResult ExecuteOperation(
         int index,
-        BatchOperation operation
-    )
+        BatchOperation operation)
     {
-        OperationResult result =
-            new OperationResult();
-
-
-        result.index =
-            index;
-
-
-        result.operation =
-            operation.operation;
-
+        OperationResult result = new OperationResult
+        {
+            index = index,
+            operation = operation?.operation ?? ""
+        };
 
         try
         {
-            switch (
-                operation.operation
-            )
+            if (operation == null)
+            {
+                throw new InvalidOperationException("Batch operation is null.");
+            }
+
+            switch (operation.operation)
             {
                 case "create_gameobject":
-                    result.message =
-                        CreateGameObject(
-                            operation
-                        );
-
+                    result.message = CreateGameObject(operation);
                     break;
-
-
                 case "create_primitive":
-                    result.message =
-                        CreatePrimitive(
-                            operation
-                        );
-
+                    result.message = CreatePrimitive(operation);
                     break;
-
-
                 case "delete_gameobject":
-                    result.message =
-                        DeleteGameObject(
-                            operation
-                        );
-
+                    result.message = DeleteGameObject(operation);
                     break;
-
-
                 case "rename_gameobject":
-                    result.message =
-                        RenameGameObject(
-                            operation
-                        );
-
+                    result.message = RenameGameObject(operation);
                     break;
-
-
                 case "set_parent":
-                    result.message =
-                        SetParent(
-                            operation
-                        );
-
+                    result.message = SetParent(operation);
                     break;
-
-
                 case "set_active":
-                    result.message =
-                        SetActive(
-                            operation
-                        );
-
+                    result.message = SetActive(operation);
                     break;
-
-
                 case "set_position":
-                    result.message =
-                        SetPosition(
-                            operation
-                        );
-
+                    result.message = SetPosition(operation);
                     break;
-
-
                 case "set_rotation":
-                    result.message =
-                        SetRotation(
-                            operation
-                        );
-
+                    result.message = SetRotation(operation);
                     break;
-
-
                 case "set_scale":
-                    result.message =
-                        SetScale(
-                            operation
-                        );
-
+                    result.message = SetScale(operation);
                     break;
-
-
                 case "add_component":
-                    result.message =
-                        AddComponent(
-                            operation
-                        );
-
+                    result.message = AddComponent(operation);
                     break;
-
-
                 case "remove_component":
-                    result.message =
-                        RemoveComponent(
-                            operation
-                        );
-
+                    result.message = RemoveComponent(operation);
                     break;
-
-
                 case "set_component_property":
-                    result.message =
-                        SetComponentProperty(
-                            operation
-                        );
-
+                    result.message = SetComponentProperty(operation);
                     break;
-
-
                 case "create_script":
-                    result.message =
-                        CreateScript(
-                            operation
-                        );
-
+                    result.message = CreateScript(operation);
                     break;
-
-
                 default:
                     throw new InvalidOperationException(
-                        "Unknown batch operation: "
-                        +
-                        operation.operation
+                        "Unknown batch operation: " + operation.operation
                     );
             }
 
-
-            result.success =
-                true;
+            result.success = true;
         }
         catch (Exception ex)
         {
-            result.success =
-                false;
-
-
-            result.message =
-                ex.Message;
+            result.success = false;
+            result.message = ex.GetType().Name + ": " + ex.Message;
         }
 
-
-        return
-            result;
+        return result;
     }
 
-
-    // ============================================================
-    // CREATE GAMEOBJECT
-    // ============================================================
-
-    private static string CreateGameObject(
-        BatchOperation operation
-    )
+    private static string CreateGameObject(BatchOperation operation)
     {
-        if (
-            string.IsNullOrWhiteSpace(
-                operation.name
-            )
-        )
+        if (string.IsNullOrWhiteSpace(operation.name))
         {
-            throw new InvalidOperationException(
-                "name is required."
-            );
+            throw new InvalidOperationException("name is required.");
         }
 
-
-        GameObject gameObject =
-            new GameObject(
-                operation.name
-            );
-
-
-        Undo.RegisterCreatedObjectUndo(
-            gameObject,
-            "AI Create GameObject"
-        );
-
-
-        if (
-            !string.IsNullOrWhiteSpace(
-                operation.parentPath
-            )
-        )
+        string desiredPath = BuildPath(operation.parentPath, operation.name);
+        GameObject existing = TryFindGameObject(desiredPath);
+        if (existing != null)
         {
-            GameObject parent =
-                FindGameObject(
-                    operation.parentPath
-                );
+            return "Reused existing " + desiredPath;
+        }
 
+        GameObject gameObject = new GameObject(operation.name);
+        Undo.RegisterCreatedObjectUndo(gameObject, "AI Create GameObject");
 
-            gameObject.transform.SetParent(
+        if (!string.IsNullOrWhiteSpace(operation.parentPath))
+        {
+            GameObject parent = FindGameObject(operation.parentPath);
+            Undo.SetTransformParent(
+                gameObject.transform,
                 parent.transform,
-                true
+                "AI Parent Created GameObject"
             );
         }
 
-
-        EditorUtility.SetDirty(
-            gameObject
-        );
-
-
-        return
-            "Created "
-            +
-            GetHierarchyPath(
-                gameObject.transform
-            );
+        EditorUtility.SetDirty(gameObject);
+        return "Created " + GetHierarchyPath(gameObject.transform);
     }
 
-
-    // ============================================================
-    // CREATE PRIMITIVE
-    // ============================================================
-
-    private static string CreatePrimitive(
-        BatchOperation operation
-    )
+    private static string CreatePrimitive(BatchOperation operation)
     {
-        PrimitiveType primitiveType;
-
-
-        if (
-            !Enum.TryParse(
-                operation.primitiveType,
-                true,
-                out primitiveType
-            )
-        )
+        if (!Enum.TryParse(operation.primitiveType, true, out PrimitiveType primitiveType))
         {
             throw new InvalidOperationException(
-                "Invalid primitiveType: "
-                +
-                operation.primitiveType
+                "Invalid primitiveType: " + operation.primitiveType
             );
         }
 
+        string objectName = string.IsNullOrWhiteSpace(operation.name)
+            ? primitiveType.ToString()
+            : operation.name;
 
-        GameObject gameObject =
-            GameObject.CreatePrimitive(
-                primitiveType
-            );
-
-
-        Undo.RegisterCreatedObjectUndo(
-            gameObject,
-            "AI Create Primitive"
-        );
-
-
-        if (
-            !string.IsNullOrWhiteSpace(
-                operation.name
-            )
-        )
+        string desiredPath = BuildPath(operation.parentPath, objectName);
+        GameObject existing = TryFindGameObject(desiredPath);
+        if (existing != null)
         {
-            gameObject.name =
-                operation.name;
+            return "Reused existing " + desiredPath;
         }
 
+        GameObject gameObject = GameObject.CreatePrimitive(primitiveType);
+        gameObject.name = objectName;
+        Undo.RegisterCreatedObjectUndo(gameObject, "AI Create Primitive");
 
-        if (
-            !string.IsNullOrWhiteSpace(
-                operation.parentPath
-            )
-        )
+        if (!string.IsNullOrWhiteSpace(operation.parentPath))
         {
-            GameObject parent =
-                FindGameObject(
-                    operation.parentPath
-                );
-
-
-            gameObject.transform.SetParent(
+            GameObject parent = FindGameObject(operation.parentPath);
+            Undo.SetTransformParent(
+                gameObject.transform,
                 parent.transform,
-                true
+                "AI Parent Created Primitive"
             );
         }
 
-
-        EditorUtility.SetDirty(
-            gameObject
-        );
-
-
-        return
-            "Created "
-            +
-            GetHierarchyPath(
-                gameObject.transform
-            );
+        EditorUtility.SetDirty(gameObject);
+        return "Created " + GetHierarchyPath(gameObject.transform);
     }
 
-
-    // ============================================================
-    // DELETE GAMEOBJECT
-    // ============================================================
-
-    private static string DeleteGameObject(
-        BatchOperation operation
-    )
+    private static string DeleteGameObject(BatchOperation operation)
     {
-        GameObject gameObject =
-            FindGameObject(
-                operation.objectPath
-            );
-
-
-        string path =
-            GetHierarchyPath(
-                gameObject.transform
-            );
-
-
-        Undo.DestroyObjectImmediate(
-            gameObject
-        );
-
-
-        return
-            "Deleted "
-            +
-            path;
+        GameObject gameObject = FindGameObject(operation.objectPath);
+        string path = GetHierarchyPath(gameObject.transform);
+        Undo.DestroyObjectImmediate(gameObject);
+        return "Deleted " + path;
     }
 
-
-    // ============================================================
-    // RENAME
-    // ============================================================
-
-    private static string RenameGameObject(
-        BatchOperation operation
-    )
+    private static string RenameGameObject(BatchOperation operation)
     {
-        GameObject gameObject =
-            FindGameObject(
-                operation.objectPath
-            );
+        if (string.IsNullOrWhiteSpace(operation.newName))
+        {
+            throw new InvalidOperationException("newName is required.");
+        }
 
+        GameObject gameObject = FindGameObject(operation.objectPath);
 
-        if (
-            string.IsNullOrWhiteSpace(
-                operation.newName
-            )
-        )
+        if (string.Equals(gameObject.name, operation.newName, StringComparison.Ordinal))
+        {
+            return "Already named " + operation.newName;
+        }
+
+        Undo.RecordObject(gameObject, "AI Rename GameObject");
+        gameObject.name = operation.newName;
+        EditorUtility.SetDirty(gameObject);
+        return "Renamed to " + GetHierarchyPath(gameObject.transform);
+    }
+
+    private static string SetParent(BatchOperation operation)
+    {
+        GameObject gameObject = FindGameObject(operation.objectPath);
+        Transform parent = string.IsNullOrWhiteSpace(operation.parentPath)
+            ? null
+            : FindGameObject(operation.parentPath).transform;
+
+        if (gameObject.transform.parent == parent)
+        {
+            return "Parent already satisfied.";
+        }
+
+        Undo.SetTransformParent(gameObject.transform, parent, "AI Set Parent");
+        return "Parent set: " + GetHierarchyPath(gameObject.transform);
+    }
+
+    private static string SetActive(BatchOperation operation)
+    {
+        GameObject gameObject = FindGameObject(operation.objectPath);
+        if (gameObject.activeSelf == operation.boolValue)
+        {
+            return "Active already " + operation.boolValue;
+        }
+
+        Undo.RecordObject(gameObject, "AI Set Active");
+        gameObject.SetActive(operation.boolValue);
+        EditorUtility.SetDirty(gameObject);
+        return "Active=" + operation.boolValue;
+    }
+
+    private static string SetPosition(BatchOperation operation)
+    {
+        GameObject gameObject = FindGameObject(operation.objectPath);
+        Vector3 value = new Vector3(operation.x, operation.y, operation.z);
+
+        if (gameObject.transform.position == value)
+        {
+            return "Position already satisfied.";
+        }
+
+        Undo.RecordObject(gameObject.transform, "AI Set Position");
+        gameObject.transform.position = value;
+        EditorUtility.SetDirty(gameObject.transform);
+        return "Position set.";
+    }
+
+    private static string SetRotation(BatchOperation operation)
+    {
+        GameObject gameObject = FindGameObject(operation.objectPath);
+        Vector3 value = new Vector3(operation.x, operation.y, operation.z);
+
+        Undo.RecordObject(gameObject.transform, "AI Set Rotation");
+        gameObject.transform.eulerAngles = value;
+        EditorUtility.SetDirty(gameObject.transform);
+        return "Rotation set.";
+    }
+
+    private static string SetScale(BatchOperation operation)
+    {
+        GameObject gameObject = FindGameObject(operation.objectPath);
+        Vector3 value = new Vector3(operation.x, operation.y, operation.z);
+
+        if (gameObject.transform.localScale == value)
+        {
+            return "Scale already satisfied.";
+        }
+
+        Undo.RecordObject(gameObject.transform, "AI Set Scale");
+        gameObject.transform.localScale = value;
+        EditorUtility.SetDirty(gameObject.transform);
+        return "Scale set.";
+    }
+
+    private static string AddComponent(BatchOperation operation)
+    {
+        GameObject gameObject = FindGameObject(operation.objectPath);
+        Type componentType = FindType(operation.componentType);
+
+        if (componentType == null)
         {
             throw new InvalidOperationException(
-                "newName is required."
+                "Component type not found: " + operation.componentType
             );
         }
 
-
-        Undo.RecordObject(
-            gameObject,
-            "AI Rename GameObject"
-        );
-
-
-        gameObject.name =
-            operation.newName;
-
-
-        EditorUtility.SetDirty(
-            gameObject
-        );
-
-
-        return
-            "Renamed to "
-            +
-            GetHierarchyPath(
-                gameObject.transform
-            );
-    }
-
-
-    // ============================================================
-    // PARENT
-    // ============================================================
-
-    private static string SetParent(
-        BatchOperation operation
-    )
-    {
-        GameObject gameObject =
-            FindGameObject(
-                operation.objectPath
-            );
-
-
-        Transform parent =
-            null;
-
-
-        if (
-            !string.IsNullOrWhiteSpace(
-                operation.parentPath
-            )
-        )
-        {
-            parent =
-                FindGameObject(
-                    operation.parentPath
-                )
-                .transform;
-        }
-
-
-        Undo.SetTransformParent(
-            gameObject.transform,
-            parent,
-            "AI Set Parent"
-        );
-
-
-        return
-            "Parent set: "
-            +
-            GetHierarchyPath(
-                gameObject.transform
-            );
-    }
-
-
-    // ============================================================
-    // ACTIVE
-    // ============================================================
-
-    private static string SetActive(
-        BatchOperation operation
-    )
-    {
-        GameObject gameObject =
-            FindGameObject(
-                operation.objectPath
-            );
-
-
-        Undo.RecordObject(
-            gameObject,
-            "AI Set Active"
-        );
-
-
-        gameObject.SetActive(
-            operation.boolValue
-        );
-
-
-        EditorUtility.SetDirty(
-            gameObject
-        );
-
-
-        return
-            "Active="
-            +
-            operation.boolValue;
-    }
-
-
-    // ============================================================
-    // POSITION
-    // ============================================================
-
-    private static string SetPosition(
-        BatchOperation operation
-    )
-    {
-        GameObject gameObject =
-            FindGameObject(
-                operation.objectPath
-            );
-
-
-        Undo.RecordObject(
-            gameObject.transform,
-            "AI Set Position"
-        );
-
-
-        gameObject.transform.position =
-            new Vector3(
-                operation.x,
-                operation.y,
-                operation.z
-            );
-
-
-        EditorUtility.SetDirty(
-            gameObject.transform
-        );
-
-
-        return
-            "Position set.";
-    }
-
-
-    // ============================================================
-    // ROTATION
-    // ============================================================
-
-    private static string SetRotation(
-        BatchOperation operation
-    )
-    {
-        GameObject gameObject =
-            FindGameObject(
-                operation.objectPath
-            );
-
-
-        Undo.RecordObject(
-            gameObject.transform,
-            "AI Set Rotation"
-        );
-
-
-        gameObject.transform.eulerAngles =
-            new Vector3(
-                operation.x,
-                operation.y,
-                operation.z
-            );
-
-
-        EditorUtility.SetDirty(
-            gameObject.transform
-        );
-
-
-        return
-            "Rotation set.";
-    }
-
-
-    // ============================================================
-    // SCALE
-    // ============================================================
-
-    private static string SetScale(
-        BatchOperation operation
-    )
-    {
-        GameObject gameObject =
-            FindGameObject(
-                operation.objectPath
-            );
-
-
-        Undo.RecordObject(
-            gameObject.transform,
-            "AI Set Scale"
-        );
-
-
-        gameObject.transform.localScale =
-            new Vector3(
-                operation.x,
-                operation.y,
-                operation.z
-            );
-
-
-        EditorUtility.SetDirty(
-            gameObject.transform
-        );
-
-
-        return
-            "Scale set.";
-    }
-
-
-    // ============================================================
-    // ADD COMPONENT
-    // ============================================================
-
-    private static string AddComponent(
-        BatchOperation operation
-    )
-    {
-        GameObject gameObject =
-            FindGameObject(
-                operation.objectPath
-            );
-
-
-        Type componentType =
-            FindType(
-                operation.componentType
-            );
-
-
-        if (
-            componentType ==
-            null
-        )
+        if (!typeof(Component).IsAssignableFrom(componentType))
         {
             throw new InvalidOperationException(
-                "Component type not found: "
-                +
-                operation.componentType
+                "Type is not a Unity Component: " + operation.componentType
             );
         }
 
-
-        if (
-            !typeof(Component)
-                .IsAssignableFrom(
-                    componentType
-                )
-        )
+        Component existing = gameObject.GetComponent(componentType);
+        if (existing != null)
         {
-            throw new InvalidOperationException(
-                "Type is not a Unity Component: "
-                +
-                operation.componentType
-            );
+            return "Component already exists: " + componentType.FullName;
         }
 
-
-        Component existing =
-            gameObject.GetComponent(
-                componentType
-            );
-
-
-        if (
-            existing != null
-        )
-        {
-            return
-                "Component already exists: "
-                +
-                componentType.FullName;
-        }
-
-
-        Undo.AddComponent(
-            gameObject,
-            componentType
-        );
-
-
-        return
-            "Added component "
-            +
-            componentType.FullName;
+        Undo.AddComponent(gameObject, componentType);
+        return "Added component " + componentType.FullName;
     }
 
-
-    // ============================================================
-    // REMOVE COMPONENT
-    // ============================================================
-
-    private static string RemoveComponent(
-        BatchOperation operation
-    )
+    private static string RemoveComponent(BatchOperation operation)
     {
-        GameObject gameObject =
-            FindGameObject(
-                operation.objectPath
-            );
+        GameObject gameObject = FindGameObject(operation.objectPath);
+        Type componentType = FindType(operation.componentType);
 
-
-        Type componentType =
-            FindType(
-                operation.componentType
-            );
-
-
-        if (
-            componentType ==
-            null
-        )
+        if (componentType == null)
         {
             throw new InvalidOperationException(
-                "Component type not found: "
-                +
-                operation.componentType
+                "Component type not found: " + operation.componentType
             );
         }
 
-
-        Component component =
-            gameObject.GetComponent(
-                componentType
-            );
-
-
-        if (
-            component ==
-            null
-        )
+        Component component = gameObject.GetComponent(componentType);
+        if (component == null)
         {
-            return
-                "Component not present.";
+            return "Component not present.";
         }
 
-
-        if (
-            component is Transform
-        )
+        if (component is Transform)
         {
-            throw new InvalidOperationException(
-                "Transform cannot be removed."
-            );
+            throw new InvalidOperationException("Transform cannot be removed.");
         }
 
-
-        Undo.DestroyObjectImmediate(
-            component
-        );
-
-
-        return
-            "Removed component "
-            +
-            componentType.FullName;
+        Undo.DestroyObjectImmediate(component);
+        return "Removed component " + componentType.FullName;
     }
 
-
-    // ============================================================
-    // SET SERIALIZED COMPONENT PROPERTY
-    // ============================================================
-
-    private static string SetComponentProperty(
-        BatchOperation operation
-    )
+    private static string SetComponentProperty(BatchOperation operation)
     {
-        GameObject gameObject =
-            FindGameObject(
-                operation.objectPath
-            );
+        GameObject gameObject = FindGameObject(operation.objectPath);
+        Type componentType = FindType(operation.componentType);
 
-
-        Type componentType =
-            FindType(
-                operation.componentType
-            );
-
-
-        if (
-            componentType ==
-            null
-        )
+        if (componentType == null)
         {
             throw new InvalidOperationException(
-                "Component type not found: "
-                +
-                operation.componentType
+                "Component type not found: " + operation.componentType
             );
         }
 
-
-        Component component =
-            gameObject.GetComponent(
-                componentType
-            );
-
-
-        if (
-            component ==
-            null
-        )
+        Component component = gameObject.GetComponent(componentType);
+        if (component == null)
         {
             throw new InvalidOperationException(
-                "Component is not attached: "
-                +
-                operation.componentType
+                "Component is not attached: " + operation.componentType
             );
         }
 
-
-        SerializedObject serializedObject =
-            new SerializedObject(
-                component
-            );
-
-
-        SerializedProperty property =
-      FindSerializedProperty(
-          serializedObject,
-          operation.propertyName
-      );
-
-
-        if (
-            property ==
-            null
-        )
-        {
-            throw new InvalidOperationException(
-                "Serialized property not found: "
-                +
-                operation.propertyName
-            );
-        }
-
-
-        Undo.RecordObject(
-            component,
-            "AI Set Component Property"
+        SerializedObject serializedObject = new SerializedObject(component);
+        SerializedProperty property = FindSerializedProperty(
+            serializedObject,
+            operation.propertyName
         );
 
+        if (property == null)
+        {
+            throw new InvalidOperationException(
+                "Serialized property not found: " + operation.propertyName
+            );
+        }
 
-        switch (
-            operation.valueType
-        )
+        Undo.RecordObject(component, "AI Set Component Property");
+
+        switch (operation.valueType)
         {
             case "int":
-                property.intValue =
-                    operation.intValue;
-
+                property.intValue = operation.intValue;
                 break;
-
-
             case "float":
-                property.floatValue =
-                    operation.floatValue;
-
+                property.floatValue = operation.floatValue;
                 break;
-
-
             case "bool":
-                property.boolValue =
-                    operation.boolValue;
-
+                property.boolValue = operation.boolValue;
                 break;
-
-
             case "string":
-                property.stringValue =
-                    operation.stringValue
-                    ??
-                    "";
-
+                property.stringValue = operation.stringValue ?? "";
                 break;
-
-
             case "vector2":
-                property.vector2Value =
-                    new Vector2(
-                        operation.x,
-                        operation.y
-                    );
-
+                property.vector2Value = new Vector2(operation.x, operation.y);
                 break;
-
-
             case "vector3":
-                property.vector3Value =
-                    new Vector3(
-                        operation.x,
-                        operation.y,
-                        operation.z
-                    );
-
+                property.vector3Value = new Vector3(
+                    operation.x,
+                    operation.y,
+                    operation.z
+                );
                 break;
-
-
             case "color":
-                property.colorValue =
-                    new Color(
-                        operation.r,
-                        operation.g,
-                        operation.b,
-                        operation.a
-                    );
-
+                property.colorValue = new Color(
+                    operation.r,
+                    operation.g,
+                    operation.b,
+                    operation.a
+                );
                 break;
-
-
             default:
                 throw new InvalidOperationException(
-                    "Unsupported valueType: "
-                    +
-                    operation.valueType
+                    "Unsupported valueType: " + operation.valueType
                 );
         }
 
-
         serializedObject.ApplyModifiedProperties();
-
-
-        EditorUtility.SetDirty(
-            component
-        );
-
-
-        return
-            "Set "
-            +
-            operation.componentType
-            +
-            "."
-            +
-            operation.propertyName;
+        EditorUtility.SetDirty(component);
+        return "Set " + operation.componentType + "." + operation.propertyName;
     }
 
-
-    // ============================================================
-    // CREATE SCRIPT
-    // ============================================================
     private static SerializedProperty FindSerializedProperty(
-    SerializedObject serializedObject,
-    string requestedName
-)
+        SerializedObject serializedObject,
+        string requestedName)
     {
         if (string.IsNullOrWhiteSpace(requestedName))
         {
             return null;
         }
 
-        // Prvo pokušava tačan Unity serialized naziv.
-        SerializedProperty exactProperty =
-            serializedObject.FindProperty(requestedName);
-
-        if (exactProperty != null)
+        SerializedProperty exact = serializedObject.FindProperty(requestedName);
+        if (exact != null)
         {
-            return exactProperty;
+            return exact;
         }
 
-        // Ako agent pošalje mass, pokušava pronaći m_Mass.
-        string normalizedRequestedName =
-            NormalizeSerializedPropertyName(requestedName);
-
-        SerializedProperty iterator =
-            serializedObject.GetIterator();
-
+        string normalizedRequested = NormalizeSerializedPropertyName(requestedName);
+        SerializedProperty iterator = serializedObject.GetIterator();
         bool enterChildren = true;
 
         while (iterator.NextVisible(enterChildren))
         {
             enterChildren = false;
-
-            // Friendly pretragu radimo samo nad glavnim svojstvima
-            // kako ne bismo slučajno pogodili neko duboko nested polje.
             if (iterator.depth != 0)
             {
                 continue;
             }
 
-            string normalizedInternalName =
-                NormalizeSerializedPropertyName(
-                    iterator.name
-                );
-
-            string normalizedDisplayName =
-                NormalizeSerializedPropertyName(
-                    iterator.displayName
-                );
-
             if (
                 string.Equals(
-                    normalizedRequestedName,
-                    normalizedInternalName,
+                    normalizedRequested,
+                    NormalizeSerializedPropertyName(iterator.name),
                     StringComparison.OrdinalIgnoreCase
-                ) ||
-                string.Equals(
-                    normalizedRequestedName,
-                    normalizedDisplayName,
+                )
+                || string.Equals(
+                    normalizedRequested,
+                    NormalizeSerializedPropertyName(iterator.displayName),
                     StringComparison.OrdinalIgnoreCase
                 )
             )
@@ -1484,345 +706,188 @@ public static class UnityBridgeBatchServer
         return null;
     }
 
-    private static string NormalizeSerializedPropertyName(
-        string propertyName
-    )
+    private static string NormalizeSerializedPropertyName(string propertyName)
     {
         if (string.IsNullOrWhiteSpace(propertyName))
         {
             return "";
         }
 
-        // m_Mass postaje Mass, m_IsKinematic postaje IsKinematic itd.
-        if (
-            propertyName.StartsWith(
-                "m_",
-                StringComparison.OrdinalIgnoreCase
-            )
-        )
+        if (propertyName.StartsWith("m_", StringComparison.OrdinalIgnoreCase))
         {
-            propertyName =
-                propertyName.Substring(2);
+            propertyName = propertyName.Substring(2);
         }
 
-        StringBuilder normalizedName =
-            new StringBuilder(propertyName.Length);
-
-        foreach (char character in propertyName)
+        StringBuilder builder = new StringBuilder(propertyName.Length);
+        foreach (char c in propertyName)
         {
-            if (char.IsLetterOrDigit(character))
+            if (char.IsLetterOrDigit(c))
             {
-                normalizedName.Append(
-                    char.ToLowerInvariant(character)
-                );
+                builder.Append(char.ToLowerInvariant(c));
             }
         }
 
-        return normalizedName.ToString();
+        return builder.ToString();
     }
-    private static string CreateScript(
-        BatchOperation operation
-    )
-    {
-        if (
-            string.IsNullOrWhiteSpace(
-                operation.assetPath
-            )
-        )
-        {
-            throw new InvalidOperationException(
-                "assetPath is required."
-            );
 
+    private static string CreateScript(BatchOperation operation)
+    {
+        if (string.IsNullOrWhiteSpace(operation.assetPath))
+        {
+            throw new InvalidOperationException("assetPath is required.");
         }
 
-
-        if (
-            !operation.assetPath.StartsWith(
-                "Assets/",
-                StringComparison.Ordinal
-            )
-        )
+        if (!operation.assetPath.StartsWith("Assets/", StringComparison.Ordinal))
         {
             throw new InvalidOperationException(
                 "Script assetPath must be inside Assets/."
             );
         }
 
-
-        if (
-            !operation.assetPath.EndsWith(
-                ".cs",
-                StringComparison.OrdinalIgnoreCase
-            )
-        )
+        if (!operation.assetPath.EndsWith(".cs", StringComparison.OrdinalIgnoreCase))
         {
             throw new InvalidOperationException(
                 "Script assetPath must end in .cs."
             );
         }
 
+        string assetsRoot = Path.GetFullPath(Application.dataPath);
+        string projectRoot = Directory.GetParent(assetsRoot).FullName;
+        string fullPath = Path.GetFullPath(
+            Path.Combine(projectRoot, operation.assetPath)
+        );
 
-        string fullPath =
-            Path.GetFullPath(
-                operation.assetPath
-            );
-
-
-        string assetsRoot =
-            Path.GetFullPath(
-                Application.dataPath
-            );
-
-
-        string projectRoot =
-            Directory.GetParent(
-                assetsRoot
-            ).FullName;
-
-
-        fullPath =
-            Path.GetFullPath(
-                Path.Combine(
-                    projectRoot,
-                    operation.assetPath
-                )
-            );
-
-
-        if (
-            !fullPath.StartsWith(
-                assetsRoot,
-                StringComparison.OrdinalIgnoreCase
-            )
-        )
+        if (!fullPath.StartsWith(assetsRoot, StringComparison.OrdinalIgnoreCase))
         {
             throw new InvalidOperationException(
                 "Script path escaped Assets directory."
             );
         }
 
-
-        string directory =
-            Path.GetDirectoryName(
-                fullPath
-            );
-
-
-        if (
-            !Directory.Exists(
-                directory
-            )
-        )
+        string directory = Path.GetDirectoryName(fullPath);
+        if (!Directory.Exists(directory))
         {
-            Directory.CreateDirectory(
-                directory
-            );
+            Directory.CreateDirectory(directory);
         }
-
 
         File.WriteAllText(
             fullPath,
-            operation.content
-            ??
-            "",
-            new UTF8Encoding(
-                false
-            )
+            operation.content ?? "",
+            new UTF8Encoding(false)
         );
-
 
         AssetDatabase.ImportAsset(
             operation.assetPath,
             ImportAssetOptions.ForceUpdate
         );
 
-
-        return
-            "Created script "
-            +
-            operation.assetPath;
+        return "Created script " + operation.assetPath;
     }
 
-
-    // ============================================================
-    // FIND GAMEOBJECT BY EXACT HIERARCHY PATH
-    // ============================================================
-
-    private static GameObject FindGameObject(
-        string objectPath
-    )
+    private static string BuildPath(string parentPath, string name)
     {
-        if (
-            string.IsNullOrWhiteSpace(
-                objectPath
-            )
-        )
+        return string.IsNullOrWhiteSpace(parentPath)
+            ? name
+            : parentPath.TrimEnd('/') + "/" + name;
+    }
+
+    private static GameObject FindGameObject(string objectPath)
+    {
+        GameObject result = TryFindGameObject(objectPath);
+        if (result == null)
         {
             throw new InvalidOperationException(
-                "objectPath is required."
+                "GameObject not found: " + objectPath
             );
         }
 
+        return result;
+    }
 
-        string[] parts =
-            objectPath.Split(
-                '/'
-            );
-
-
-        GameObject current =
-            null;
-
-
-        GameObject[] roots =
-            UnityEngine.SceneManagement
-                .SceneManager
-                .GetActiveScene()
-                .GetRootGameObjects();
-
-
-        foreach (
-            GameObject root
-            in roots
-        )
+    private static GameObject TryFindGameObject(string objectPath)
+    {
+        if (string.IsNullOrWhiteSpace(objectPath))
         {
-            if (
-                root.name ==
-                parts[0]
-            )
-            {
-                current =
-                    root;
+            return null;
+        }
 
+        string[] parts = objectPath
+            .Replace('\\', '/')
+            .Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries);
+
+        if (parts.Length == 0)
+        {
+            return null;
+        }
+
+        GameObject current = null;
+        foreach (GameObject root in SceneManager.GetActiveScene().GetRootGameObjects())
+        {
+            if (root.name == parts[0])
+            {
+                current = root;
                 break;
             }
         }
 
-
-        if (
-            current ==
-            null
-        )
+        if (current == null)
         {
-            throw new InvalidOperationException(
-                "GameObject not found: "
-                +
-                objectPath
-            );
+            return null;
         }
 
-
-        for (
-            int i = 1;
-            i < parts.Length;
-            i++
-        )
+        for (int i = 1; i < parts.Length; i++)
         {
-            Transform child =
-                current.transform.Find(
-                    parts[i]
-                );
-
-
-            if (
-                child ==
-                null
-            )
+            Transform child = current.transform.Find(parts[i]);
+            if (child == null)
             {
-                throw new InvalidOperationException(
-                    "GameObject not found: "
-                    +
-                    objectPath
-                );
+                return null;
             }
 
-
-            current =
-                child.gameObject;
+            current = child.gameObject;
         }
 
-
-        return
-            current;
+        return current;
     }
 
-
-    // ============================================================
-    // TYPE LOOKUP
-    // ============================================================
-
-    private static Type FindType(
-     string typeName
- )
+    private static Type FindType(string typeName)
     {
         if (string.IsNullOrWhiteSpace(typeName))
         {
             return null;
         }
 
-        if (
-            componentTypeCache.TryGetValue(
-                typeName,
-                out Type cachedType
-            )
-        )
+        if (componentTypeCache.TryGetValue(typeName, out Type cached))
         {
-            return cachedType;
+            return cached;
         }
 
-        // Prvo pokušaj brzo pronalaženje punog imena
-        // bez assembly.GetTypes() skeniranja.
-        foreach (
-            System.Reflection.Assembly assembly
-            in AppDomain.CurrentDomain.GetAssemblies()
-        )
+        foreach (System.Reflection.Assembly assembly in AppDomain.CurrentDomain.GetAssemblies())
         {
-            Type exactType =
-                assembly.GetType(
-                    typeName,
-                    throwOnError: false,
-                    ignoreCase: true
-                );
+            Type exact = assembly.GetType(
+                typeName,
+                throwOnError: false,
+                ignoreCase: true
+            );
 
-            if (
-                exactType != null
-                &&
-                typeof(Component).IsAssignableFrom(
-                    exactType
-                )
-            )
+            if (exact != null && typeof(Component).IsAssignableFrom(exact))
             {
-                componentTypeCache[typeName] =
-                    exactType;
-
-                return exactType;
+                componentTypeCache[typeName] = exact;
+                return exact;
             }
         }
 
-        // Za kratka imena poput Rigidbody koristi
-        // Unityjev već pripremljen i optimizovan TypeCache.
-        foreach (
-            Type candidate
-            in TypeCache.GetTypesDerivedFrom<Component>()
-        )
+        foreach (Type candidate in TypeCache.GetTypesDerivedFrom<Component>())
         {
             if (
-                candidate.Name.Equals(
-                    typeName,
-                    StringComparison.OrdinalIgnoreCase
-                )
-                ||
-                string.Equals(
+                candidate.Name.Equals(typeName, StringComparison.OrdinalIgnoreCase)
+                || string.Equals(
                     candidate.FullName,
                     typeName,
                     StringComparison.OrdinalIgnoreCase
                 )
             )
             {
-                componentTypeCache[typeName] =
-                    candidate;
-
+                componentTypeCache[typeName] = candidate;
                 return candidate;
             }
         }
@@ -1830,86 +895,33 @@ public static class UnityBridgeBatchServer
         return null;
     }
 
-
-    // ============================================================
-    // PATH
-    // ============================================================
-
-    private static string GetHierarchyPath(
-        Transform transform
-    )
+    private static string GetHierarchyPath(Transform transform)
     {
-        string path =
-            transform.name;
+        string path = transform.name;
+        Transform parent = transform.parent;
 
-
-        Transform parent =
-            transform.parent;
-
-
-        while (
-            parent != null
-        )
+        while (parent != null)
         {
-            path =
-                parent.name
-                +
-                "/"
-                +
-                path;
-
-
-            parent =
-                parent.parent;
+            path = parent.name + "/" + path;
+            parent = parent.parent;
         }
 
-
-        return
-            path;
+        return path;
     }
-
-
-    // ============================================================
-    // RESPONSE
-    // ============================================================
 
     private static void WriteResponse(
         HttpListenerContext context,
         int statusCode,
-        string json
-    )
+        string json)
     {
         try
         {
-            byte[] bytes =
-                Encoding.UTF8.GetBytes(
-                    json
-                );
-
-
-            context.Response.StatusCode =
-                statusCode;
-
-
-            context.Response.ContentType =
-                "application/json";
-
-
-            context.Response.ContentEncoding =
-                Encoding.UTF8;
-
-
-            context.Response.ContentLength64 =
-                bytes.Length;
-
-
-            context.Response.OutputStream.Write(
-                bytes,
-                0,
-                bytes.Length
-            );
-
-
+            byte[] bytes = Encoding.UTF8.GetBytes(json);
+            context.Response.StatusCode = statusCode;
+            context.Response.ContentType = "application/json";
+            context.Response.ContentEncoding = Encoding.UTF8;
+            context.Response.ContentLength64 = bytes.Length;
+            context.Response.OutputStream.Write(bytes, 0, bytes.Length);
             context.Response.OutputStream.Close();
         }
         catch
@@ -1917,133 +929,76 @@ public static class UnityBridgeBatchServer
         }
     }
 
-
-    // ============================================================
-    // DTO
-    // ============================================================
-
     [Serializable]
     private class BatchRequest
     {
         public BatchOperation[] operations;
-
-        public bool stopOnFailure =
-            true;
-
-        public bool saveScene =
-            false;
+        public bool stopOnFailure = true;
+        public bool saveScene = false;
     }
-
 
     [Serializable]
     private class BatchOperation
     {
         public string operation;
-
-
-        // Object identifiers
         public string objectPath;
-
         public string parentPath;
-
         public string name;
-
         public string newName;
-
-
-        // Primitive
         public string primitiveType;
-
-
-        // Component
         public string componentType;
-
         public string propertyName;
-
-
-        // Generic serialized value
         public string valueType;
-
         public int intValue;
-
         public float floatValue;
-
         public bool boolValue;
-
         public string stringValue;
-
-
-        // Vector
         public float x;
-
         public float y;
-
         public float z;
-
-
-        // Color
         public float r;
-
         public float g;
-
         public float b;
-
-        public float a =
-            1f;
-
-
-        // Script
+        public float a = 1f;
         public string assetPath;
-
         public string content;
     }
-
 
     [Serializable]
     private class BatchResponse
     {
         public bool success;
-
+        public bool rolledBack;
         public List<OperationResult> results;
     }
-
 
     [Serializable]
     private class OperationResult
     {
         public int index;
-
         public string operation;
-
         public bool success;
-
         public string message;
     }
-
 
     [Serializable]
     private class BasicResponse
     {
         public bool success;
-
         public string message;
     }
+
     private sealed class PendingBatch
     {
         public HttpListenerContext context;
-
         public BatchRequest request;
 
         public PendingBatch(
             HttpListenerContext context,
-            BatchRequest request
-        )
+            BatchRequest request)
         {
-            this.context =
-                context;
-
-            this.request =
-                request;
+            this.context = context;
+            this.request = request;
         }
     }
 }
