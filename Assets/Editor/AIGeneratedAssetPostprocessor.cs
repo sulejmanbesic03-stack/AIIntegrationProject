@@ -7,7 +7,7 @@ using UnityEngine;
 /// <summary>
 /// Import policy for assets handed off by AI Assistant's controlled Blender pipeline.
 /// The desktop app copies exported assets to Assets/AI_Generated/Models.
-/// Unity imports them normally; this postprocessor applies predictable model defaults.
+/// Unity imports them normally; this postprocessor applies conservative model defaults.
 /// </summary>
 public sealed class AIGeneratedAssetPostprocessor : AssetPostprocessor
 {
@@ -20,7 +20,8 @@ public sealed class AIGeneratedAssetPostprocessor : AssetPostprocessor
             return;
         }
 
-        if (assetImporter is not ModelImporter importer)
+        ModelImporter importer = assetImporter as ModelImporter;
+        if (importer == null)
         {
             return;
         }
@@ -28,13 +29,11 @@ public sealed class AIGeneratedAssetPostprocessor : AssetPostprocessor
         importer.globalScale = 1f;
         importer.importCameras = false;
         importer.importLights = false;
-        importer.importVisibility = true;
         importer.importBlendShapes = true;
         importer.isReadable = false;
         importer.meshCompression = ModelImporterMeshCompression.Off;
         importer.optimizeMeshPolygons = true;
         importer.optimizeMeshVertices = true;
-        importer.materialImportMode = ModelImporterMaterialImportMode.ImportStandard;
     }
 
     private static void OnPostprocessAllAssets(
@@ -68,8 +67,15 @@ public sealed class AIGeneratedAssetPostprocessor : AssetPostprocessor
     [MenuItem("AI Assistant/Generated Assets/Reveal Folder")]
     private static void RevealGeneratedFolder()
     {
+        DirectoryInfo projectDirectory = Directory.GetParent(Application.dataPath);
+        if (projectDirectory == null)
+        {
+            Debug.LogWarning("[AI Asset Pipeline] Could not resolve Unity project root.");
+            return;
+        }
+
         string absolute = Path.Combine(
-            Directory.GetParent(Application.dataPath)!.FullName,
+            projectDirectory.FullName,
             "Assets",
             "AI_Generated",
             "Models"
