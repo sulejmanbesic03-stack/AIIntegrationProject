@@ -191,7 +191,7 @@ public sealed class AIGeneratedAssetPostprocessor : AssetPostprocessor
 
             Undo.RegisterCreatedObjectUndo(sceneRoot, "AI Generated Scene");
             Selection.activeGameObject = sceneRoot;
-            EditorSceneManager.MarkSceneDirty(EditorSceneManager.GetActiveScene());
+            EditorSceneManager.MarkSceneDirty(sceneRoot.scene);
             EditorSceneManager.SaveOpenScenes();
 
             Debug.Log(
