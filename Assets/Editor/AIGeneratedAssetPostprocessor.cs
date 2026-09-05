@@ -1,5 +1,6 @@
 #if UNITY_EDITOR
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using UnityEditor;
@@ -11,7 +12,8 @@ using UnityEngine;
 /// Blender exports unique reusable models under Assets/AI_Generated/Models and
 /// writes an .aiscene.json manifest under Assets/AI_Generated/Scenes. Unity
 /// imports the models, then this postprocessor idempotently assembles the requested
-/// instances into the currently open scene.
+/// instances into the currently open scene and performs a conservative spatial
+/// sanity pass (grounding + duplicate overlap correction).
 /// </summary>
 public sealed class AIGeneratedAssetPostprocessor : AssetPostprocessor
 {
@@ -123,10 +125,7 @@ public sealed class AIGeneratedAssetPostprocessor : AssetPostprocessor
             {
                 if (!manifest.replaceExisting)
                 {
-                    Debug.Log(
-                        "[AI Asset Pipeline] Existing generated scene root retained: "
-                        + rootName
-                    );
+                    Debug.Log("[AI Asset Pipeline] Existing generated scene root retained: " + rootName);
                     return;
                 }
 
@@ -134,6 +133,7 @@ public sealed class AIGeneratedAssetPostprocessor : AssetPostprocessor
             }
 
             GameObject sceneRoot = new GameObject(rootName);
+            List<SpawnedInstance> spawned = new List<SpawnedInstance>();
             int instantiated = 0;
             int missing = 0;
 
@@ -150,16 +150,10 @@ public sealed class AIGeneratedAssetPostprocessor : AssetPostprocessor
                     ImportAssetOptions.ForceSynchronousImport
                 );
 
-                GameObject model = AssetDatabase.LoadAssetAtPath<GameObject>(
-                    instance.assetPath
-                );
-
+                GameObject model = AssetDatabase.LoadAssetAtPath<GameObject>(instance.assetPath);
                 if (model == null)
                 {
-                    Debug.LogWarning(
-                        "[AI Asset Pipeline] Model not ready for scene assembly: "
-                        + instance.assetPath
-                    );
+                    Debug.LogWarning("[AI Asset Pipeline] Model not ready for scene assembly: " + instance.assetPath);
                     missing++;
                     continue;
                 }
@@ -177,17 +171,25 @@ public sealed class AIGeneratedAssetPostprocessor : AssetPostprocessor
                 created.transform.localPosition = ReadVector(instance.position, Vector3.zero);
                 created.transform.localEulerAngles = ReadVector(instance.rotation, Vector3.zero);
                 created.transform.localScale = ReadVector(instance.scale, Vector3.one, true);
+
+                spawned.Add(new SpawnedInstance
+                {
+                    GameObject = created,
+                    AssetPath = instance.assetPath
+                });
                 instantiated++;
             }
 
             if (instantiated == 0)
             {
                 UnityEngine.Object.DestroyImmediate(sceneRoot);
-                Debug.LogError(
-                    "[AI Asset Pipeline] Scene assembly failed: no generated model could be instantiated."
-                );
+                Debug.LogError("[AI Asset Pipeline] Scene assembly failed: no generated model could be instantiated.");
                 return;
             }
+
+            float groundY = ResolveGroundY();
+            int grounded = GroundInstances(spawned, groundY);
+            int nudged = ResolveDuplicateOverlaps(spawned);
 
             Undo.RegisterCreatedObjectUndo(sceneRoot, "AI Generated Scene");
             Selection.activeGameObject = sceneRoot;
@@ -199,6 +201,8 @@ public sealed class AIGeneratedAssetPostprocessor : AssetPostprocessor
                 + rootName
                 + " | instances=" + instantiated
                 + " | missing=" + missing
+                + " | grounded=" + grounded
+                + " | overlapFixes=" + nudged
                 + " | manifest=" + manifestAssetPath
             );
         }
@@ -213,6 +217,152 @@ public sealed class AIGeneratedAssetPostprocessor : AssetPostprocessor
         }
     }
 
+    private static int GroundInstances(List<SpawnedInstance> spawned, float groundY)
+    {
+        int count = 0;
+        foreach (SpawnedInstance item in spawned)
+        {
+            if (item?.GameObject == null)
+            {
+                continue;
+            }
+
+            if (!TryGetWorldBounds(item.GameObject, out Bounds bounds))
+            {
+                continue;
+            }
+
+            float delta = groundY - bounds.min.y;
+            if (Mathf.Abs(delta) <= 0.01f)
+            {
+                continue;
+            }
+
+            Vector3 position = item.GameObject.transform.position;
+            position.y += delta;
+            item.GameObject.transform.position = position;
+            count++;
+        }
+        return count;
+    }
+
+    private static int ResolveDuplicateOverlaps(List<SpawnedInstance> spawned)
+    {
+        int fixes = 0;
+        foreach (IGrouping<string, SpawnedInstance> group in spawned
+            .Where(x => x != null && x.GameObject != null && !string.IsNullOrWhiteSpace(x.AssetPath))
+            .GroupBy(x => x.AssetPath, StringComparer.OrdinalIgnoreCase))
+        {
+            List<SpawnedInstance> items = group.ToList();
+            if (items.Count < 2)
+            {
+                continue;
+            }
+
+            for (int i = 1; i < items.Count; i++)
+            {
+                SpawnedInstance current = items[i];
+                if (!TryGetWorldBounds(current.GameObject, out Bounds currentBounds))
+                {
+                    continue;
+                }
+
+                int guard = 0;
+                while (guard++ < 8)
+                {
+                    bool severeOverlap = false;
+                    float requiredShift = 0f;
+
+                    for (int j = 0; j < i; j++)
+                    {
+                        if (!TryGetWorldBounds(items[j].GameObject, out Bounds other))
+                        {
+                            continue;
+                        }
+
+                        if (!OverlapsSeverelyXZ(currentBounds, other))
+                        {
+                            continue;
+                        }
+
+                        severeOverlap = true;
+                        requiredShift = Mathf.Max(
+                            requiredShift,
+                            (currentBounds.extents.x + other.extents.x) + 0.6f
+                        );
+                    }
+
+                    if (!severeOverlap)
+                    {
+                        break;
+                    }
+
+                    Vector3 p = current.GameObject.transform.position;
+                    p.x += Mathf.Max(0.75f, requiredShift);
+                    current.GameObject.transform.position = p;
+                    TryGetWorldBounds(current.GameObject, out currentBounds);
+                    fixes++;
+                }
+            }
+        }
+
+        return fixes;
+    }
+
+    private static bool OverlapsSeverelyXZ(Bounds a, Bounds b)
+    {
+        float overlapX = Mathf.Min(a.max.x, b.max.x) - Mathf.Max(a.min.x, b.min.x);
+        float overlapZ = Mathf.Min(a.max.z, b.max.z) - Mathf.Max(a.min.z, b.min.z);
+        if (overlapX <= 0f || overlapZ <= 0f)
+        {
+            return false;
+        }
+
+        float minX = Mathf.Max(0.001f, Mathf.Min(a.size.x, b.size.x));
+        float minZ = Mathf.Max(0.001f, Mathf.Min(a.size.z, b.size.z));
+        return overlapX / minX > 0.65f && overlapZ / minZ > 0.65f;
+    }
+
+    private static float ResolveGroundY()
+    {
+        GameObject ground = FindSceneObject("Ground") ?? FindSceneObject("Terrain");
+        if (ground == null)
+        {
+            return 0f;
+        }
+
+        Collider collider = ground.GetComponent<Collider>();
+        if (collider != null)
+        {
+            return collider.bounds.max.y;
+        }
+
+        Renderer renderer = ground.GetComponent<Renderer>();
+        if (renderer != null)
+        {
+            return renderer.bounds.max.y;
+        }
+
+        return ground.transform.position.y;
+    }
+
+    private static bool TryGetWorldBounds(GameObject root, out Bounds bounds)
+    {
+        Renderer[] renderers = root.GetComponentsInChildren<Renderer>(true);
+        if (renderers.Length == 0)
+        {
+            bounds = default;
+            return false;
+        }
+
+        bounds = renderers[0].bounds;
+        for (int i = 1; i < renderers.Length; i++)
+        {
+            bounds.Encapsulate(renderers[i].bounds);
+        }
+        return true;
+    }
+
     private static GameObject FindSceneObject(string name)
     {
         return Resources.FindObjectsOfTypeAll<GameObject>()
@@ -224,11 +374,7 @@ public sealed class AIGeneratedAssetPostprocessor : AssetPostprocessor
             );
     }
 
-    private static Vector3 ReadVector(
-        float[] values,
-        Vector3 fallback,
-        bool protectZeroScale = false
-    )
+    private static Vector3 ReadVector(float[] values, Vector3 fallback, bool protectZeroScale = false)
     {
         if (values == null || values.Length < 3)
         {
@@ -256,11 +402,7 @@ public sealed class AIGeneratedAssetPostprocessor : AssetPostprocessor
             return;
         }
 
-        string absolute = Path.Combine(
-            projectDirectory.FullName,
-            "Assets",
-            "AI_Generated"
-        );
+        string absolute = Path.Combine(projectDirectory.FullName, "Assets", "AI_Generated");
         Directory.CreateDirectory(absolute);
         EditorUtility.RevealInFinder(absolute);
     }
@@ -290,6 +432,12 @@ public sealed class AIGeneratedAssetPostprocessor : AssetPostprocessor
         public float[] position;
         public float[] rotation;
         public float[] scale;
+    }
+
+    private sealed class SpawnedInstance
+    {
+        public GameObject GameObject;
+        public string AssetPath;
     }
 }
 #endif
