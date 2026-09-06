@@ -30,7 +30,11 @@ public sealed class AIGeneratedAssetPostprocessor : AssetPostprocessor
             return;
         }
 
-        importer.globalScale = 1f;
+        // Blender's FBX exporter writes the generated assets in centimetre FBX
+        // units. Keep the Unity scene in metres and bake the axis conversion so
+        // callers never need the manual Scale=100 / Rotation X=-90 workaround.
+        importer.globalScale = 100f;
+        importer.bakeAxisConversion = true;
         importer.importCameras = false;
         importer.importLights = false;
         importer.importBlendShapes = true;
@@ -154,6 +158,7 @@ public sealed class AIGeneratedAssetPostprocessor : AssetPostprocessor
 
         if (model == null)
         {
+            WriteHandoffResult(manifest, false, "Blender scene bundle is not ready: " + manifest.prefabAssetPath, "");
             Debug.LogError(
                 "[AI Asset Pipeline] Blender-authored scene bundle is not ready: "
                 + manifest.prefabAssetPath
@@ -191,6 +196,7 @@ public sealed class AIGeneratedAssetPostprocessor : AssetPostprocessor
 
         if (savedPrefab == null)
         {
+            WriteHandoffResult(manifest, false, "Could not create Unity prefab: " + prefabPath, prefabPath);
             Debug.LogError(
                 "[AI Asset Pipeline] Could not create Unity prefab from Blender scene bundle: "
                 + prefabPath
@@ -203,6 +209,7 @@ public sealed class AIGeneratedAssetPostprocessor : AssetPostprocessor
         {
             if (!manifest.replaceExisting)
             {
+                WriteHandoffResult(manifest, false, "Existing generated scene root retained because replaceExisting=false.", "");
                 Debug.Log(
                     "[AI Asset Pipeline] Existing generated scene root retained: "
                     + rootName
@@ -210,13 +217,18 @@ public sealed class AIGeneratedAssetPostprocessor : AssetPostprocessor
                 return;
             }
 
-            UnityEngine.Object.DestroyImmediate(existingRoot);
+            Undo.DestroyObjectImmediate(existingRoot);
         }
 
         GameObject created = PrefabUtility.InstantiatePrefab(savedPrefab) as GameObject;
         if (created == null)
         {
             created = UnityEngine.Object.Instantiate(savedPrefab);
+            if (created == null)
+            {
+                WriteHandoffResult(manifest, false, "Could not instantiate generated prefab: " + prefabPath, prefabPath);
+                return;
+            }
         }
 
         created.name = rootName;
@@ -227,8 +239,7 @@ public sealed class AIGeneratedAssetPostprocessor : AssetPostprocessor
         Undo.RegisterCreatedObjectUndo(created, "AI Generated Blender Prefab Scene");
         Selection.activeGameObject = created;
         EditorSceneManager.MarkSceneDirty(created.scene);
-        EditorSceneManager.SaveOpenScenes();
-
+        WriteHandoffResult(manifest, true, "Blender-authored scene imported successfully.", prefabPath);
         Debug.Log(
             "[AI Asset Pipeline] Blender-authored scene imported 1:1 as prefab: "
             + prefabPath
@@ -251,6 +262,7 @@ public sealed class AIGeneratedAssetPostprocessor : AssetPostprocessor
         {
             if (!manifest.replaceExisting)
             {
+                WriteHandoffResult(manifest, false, "Existing generated scene root retained because replaceExisting=false.", "");
                 Debug.Log(
                     "[AI Asset Pipeline] Existing generated scene root retained: "
                     + rootName
@@ -258,7 +270,7 @@ public sealed class AIGeneratedAssetPostprocessor : AssetPostprocessor
                 return;
             }
 
-            UnityEngine.Object.DestroyImmediate(existingRoot);
+            Undo.DestroyObjectImmediate(existingRoot);
         }
 
         GameObject sceneRoot = new GameObject(rootName);
@@ -307,6 +319,7 @@ public sealed class AIGeneratedAssetPostprocessor : AssetPostprocessor
         if (instantiated == 0)
         {
             UnityEngine.Object.DestroyImmediate(sceneRoot);
+            WriteHandoffResult(manifest, false, "No generated model could be instantiated.", "");
             Debug.LogError("[AI Asset Pipeline] Legacy scene assembly failed: no generated model could be instantiated.");
             return;
         }
@@ -314,8 +327,7 @@ public sealed class AIGeneratedAssetPostprocessor : AssetPostprocessor
         Undo.RegisterCreatedObjectUndo(sceneRoot, "AI Generated Scene");
         Selection.activeGameObject = sceneRoot;
         EditorSceneManager.MarkSceneDirty(sceneRoot.scene);
-        EditorSceneManager.SaveOpenScenes();
-
+        WriteHandoffResult(manifest, true, "Legacy generated scene assembled successfully.", "");
         Debug.Log(
             "[AI Asset Pipeline] Legacy scene assembled: "
             + rootName
@@ -354,6 +366,40 @@ public sealed class AIGeneratedAssetPostprocessor : AssetPostprocessor
             value = value.Replace(invalid, '_');
         }
         return string.IsNullOrWhiteSpace(value) ? "AI_Generated_Scene" : value;
+    }
+
+    private static void WriteHandoffResult(
+        GeneratedSceneManifest manifest,
+        bool success,
+        string message,
+        string prefabPath
+    )
+    {
+        try
+        {
+            string projectRoot = Directory.GetParent(Application.dataPath)?.FullName ?? "";
+            string relative = string.IsNullOrWhiteSpace(manifest.resultPath)
+                ? "Library/AI_Assistant/Handoffs/unknown.airesult.json"
+                : manifest.resultPath;
+            string absolute = Path.Combine(projectRoot, relative.Replace('/', Path.DirectorySeparatorChar));
+            string directory = Path.GetDirectoryName(absolute);
+            if (!string.IsNullOrWhiteSpace(directory)) Directory.CreateDirectory(directory);
+            File.WriteAllText(
+                absolute,
+                JsonUtility.ToJson(new GeneratedHandoffResult
+                {
+                    requestId = manifest.requestId ?? "",
+                    success = success,
+                    message = message,
+                    prefabPath = prefabPath ?? "",
+                    completedUtc = DateTime.UtcNow.ToString("O")
+                }, true)
+            );
+        }
+        catch (Exception ex)
+        {
+            Debug.LogError("[AI Asset Pipeline] Could not write handoff result: " + ex.Message);
+        }
     }
 
     private static GameObject FindSceneObject(string name)
@@ -419,12 +465,25 @@ public sealed class AIGeneratedAssetPostprocessor : AssetPostprocessor
     private sealed class GeneratedSceneManifest
     {
         public int version;
+        public string requestId;
+        public string resultPath;
+        public float importScale = 100f;
         public string sceneName;
         public string rootName;
         public bool replaceExisting = true;
         public string prefabAssetPath;
         public string prefabOutputPath;
         public GeneratedSceneInstance[] instances;
+    }
+
+    [Serializable]
+    private sealed class GeneratedHandoffResult
+    {
+        public string requestId;
+        public bool success;
+        public string message;
+        public string prefabPath;
+        public string completedUtc;
     }
 
     [Serializable]

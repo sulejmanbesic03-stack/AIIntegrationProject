@@ -52,6 +52,15 @@ public static class UnityPersistentScriptServer
     private const string JobCompilationStartedKey =
         "AI.PersistentScript.CompilationStarted";
 
+    private const string JobBackupPathKey =
+        "AI.PersistentScript.BackupPath";
+
+    private const string JobHadExistingFileKey =
+        "AI.PersistentScript.HadExistingFile";
+
+    private const string JobRollbackAppliedKey =
+        "AI.PersistentScript.RollbackApplied";
+
     private const int MaxCompileStartAttempts =
         2;
 
@@ -403,6 +412,8 @@ public static class UnityPersistentScriptServer
                     string existingJobId =
                         Guid.NewGuid().ToString("N");
 
+                    if (IsCompiledMonoBehaviourLoaded(request.className))
+                    {
                     SetJob(
                         existingJobId,
                         "compiled",
@@ -427,6 +438,7 @@ public static class UnityPersistentScriptServer
                         }
                     );
                     return;
+                    }
                 }
 
                 if (!request.overwrite)
@@ -442,12 +454,21 @@ public static class UnityPersistentScriptServer
                     return;
                 }
 
-                BackupExistingScript(
+                string backupPath = BackupExistingScript(
                     projectRoot,
                     normalizedAssetPath,
                     absolutePath
                 );
+                SessionState.SetString(JobBackupPathKey, backupPath);
+                SessionState.SetBool(JobHadExistingFileKey, true);
             }
+            else
+            {
+                SessionState.SetString(JobBackupPathKey, "");
+                SessionState.SetBool(JobHadExistingFileKey, false);
+            }
+
+            SessionState.SetBool(JobRollbackAppliedKey, false);
 
             string directory =
                 Path.GetDirectoryName(absolutePath);
@@ -858,12 +879,12 @@ public static class UnityPersistentScriptServer
             diagnostics
         );
 
-        SessionState.SetString(
-            JobStateKey,
-            string.IsNullOrWhiteSpace(diagnostics)
-                ? "compiled"
-                : "failed"
-        );
+        bool failed = !string.IsNullOrWhiteSpace(diagnostics);
+        SessionState.SetString(JobStateKey, failed ? "failed" : "compiled");
+        if (failed)
+        {
+            RestoreFailedScriptIfNeeded();
+        }
     }
 
 
@@ -1113,7 +1134,7 @@ public static class UnityPersistentScriptServer
     }
 
 
-    private static void BackupExistingScript(
+    private static string BackupExistingScript(
         string projectRoot,
         string assetPath,
         string absolutePath
@@ -1134,11 +1155,36 @@ public static class UnityPersistentScriptServer
             + "-"
             + Path.GetFileName(assetPath);
 
-        File.Copy(
-            absolutePath,
-            Path.Combine(backupRoot, backupName),
-            overwrite: false
-        );
+        string backupPath = Path.Combine(backupRoot, backupName);
+        File.Copy(absolutePath, backupPath, overwrite: false);
+        return backupPath;
+    }
+
+    private static void RestoreFailedScriptIfNeeded()
+    {
+        if (SessionState.GetBool(JobRollbackAppliedKey, false)) return;
+        string assetPath = SessionState.GetString(JobAssetPathKey, "");
+        string backupPath = SessionState.GetString(JobBackupPathKey, "");
+        string projectRoot = Directory.GetCurrentDirectory();
+        string absolutePath = Path.GetFullPath(Path.Combine(projectRoot, assetPath));
+        try
+        {
+            if (SessionState.GetBool(JobHadExistingFileKey, false) && File.Exists(backupPath))
+            {
+                File.Copy(backupPath, absolutePath, overwrite: true);
+            }
+            else if (!string.IsNullOrWhiteSpace(absolutePath) && File.Exists(absolutePath))
+            {
+                File.Delete(absolutePath);
+            }
+            SessionState.SetBool(JobRollbackAppliedKey, true);
+            AssetDatabase.ImportAsset(assetPath, ImportAssetOptions.ForceUpdate);
+            SessionState.SetString(JobDiagnosticsKey, SessionState.GetString(JobDiagnosticsKey, "") + "\nGenerated source was rolled back after compilation failure.");
+        }
+        catch (Exception ex)
+        {
+            SessionState.SetString(JobDiagnosticsKey, SessionState.GetString(JobDiagnosticsKey, "") + "\nRollback failed: " + ex.Message);
+        }
     }
 
 
